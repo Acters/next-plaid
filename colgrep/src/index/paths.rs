@@ -5,7 +5,7 @@
 //! - macOS: ~/Library/Application Support/colgrep/indices/
 //! - Windows: C:\Users\{user}\AppData\Roaming\colgrep\indices\
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -240,13 +240,36 @@ pub fn get_lock_path(index_dir: &Path) -> PathBuf {
     index_dir.join(LOCK_FILE)
 }
 
+fn open_index_lock(index_dir: &Path) -> Result<File> {
+    fs::create_dir_all(index_dir)?;
+    let lock_path = get_lock_path(index_dir);
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file at {}", lock_path.display()))
+}
+
+fn open_existing_index_lock(index_dir: &Path) -> Result<File> {
+    let lock_path = get_lock_path(index_dir);
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Missing prepared index lock at {}; run `colgrep init` first",
+                lock_path.display()
+            )
+        })
+}
+
 /// Try to acquire the index lock without waiting.
 /// Returns `Ok(Some(file))` if acquired, `Ok(None)` if another process holds it.
 pub fn try_acquire_index_lock(index_dir: &Path) -> Result<Option<File>> {
-    fs::create_dir_all(index_dir)?;
-    let lock_path = get_lock_path(index_dir);
-    let lock_file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file at {}", lock_path.display()))?;
+    let lock_file = open_index_lock(index_dir)?;
 
     match lock_file.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock_file)),
@@ -254,29 +277,59 @@ pub fn try_acquire_index_lock(index_dir: &Path) -> Result<Option<File>> {
     }
 }
 
-/// Acquires an exclusive lock on the index directory.
-/// Returns a guard (File handle) that releases the lock when dropped.
-///
-/// If another process holds the lock, retries for up to 5 seconds before
-/// returning an error.
+/// Try to acquire a shared/read lock without waiting.
+/// Returns `Ok(Some(file))` if acquired, `Ok(None)` if a writer holds the lock.
+/// The returned file is the read-lock guard and releases the lock when dropped.
+pub fn try_acquire_index_read_lock(index_dir: &Path) -> Result<Option<File>> {
+    let lock_file = open_existing_index_lock(index_dir)?;
+
+    match lock_file.try_lock_shared() {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Acquire a shared/read lock, waiting up to five seconds for an exclusive
+/// writer to finish. The returned file releases the lock when dropped.
+pub fn acquire_index_read_lock(index_dir: &Path) -> Result<File> {
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    let lock_file = open_existing_index_lock(index_dir)?;
+
+    let start = Instant::now();
+    loop {
+        match lock_file.try_lock_shared() {
+            Ok(()) => return Ok(lock_file),
+            Err(_) if start.elapsed() < TIMEOUT => std::thread::sleep(RETRY_INTERVAL),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for shared index lock after 5 seconds. \
+                     Another colgrep instance may be updating this index."
+                ));
+            }
+        }
+    }
+}
+
+/// Acquires an exclusive lock on the index directory. Returns a guard that
+/// releases the lock when dropped. If another process holds a shared or
+/// exclusive lock, retries for up to five seconds before returning an error.
 pub fn acquire_index_lock(index_dir: &Path) -> Result<File> {
     use std::time::{Duration, Instant};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
-    fs::create_dir_all(index_dir)?;
-    let lock_path = get_lock_path(index_dir);
-    let lock_file = File::create(&lock_path)
-        .with_context(|| format!("Failed to create lock file at {}", lock_path.display()))?;
+    let lock_file = open_index_lock(index_dir)?;
 
     let start = Instant::now();
     loop {
         match lock_file.try_lock_exclusive() {
             Ok(()) => return Ok(lock_file),
-            Err(_) if start.elapsed() < TIMEOUT => {
-                std::thread::sleep(RETRY_INTERVAL);
-            }
+            Err(_) if start.elapsed() < TIMEOUT => std::thread::sleep(RETRY_INTERVAL),
             Err(_) => {
                 return Err(anyhow::anyhow!(
                     "Timed out waiting for index lock after 5 seconds. \
@@ -290,6 +343,14 @@ pub fn acquire_index_lock(index_dir: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepare_lock_file(index_dir: &Path) {
+        drop(
+            try_acquire_index_lock(index_dir)
+                .unwrap()
+                .expect("lock file preparation must succeed"),
+        );
+    }
 
     #[test]
     fn test_compute_index_dir_name() {
@@ -338,6 +399,68 @@ mod tests {
             try_acquire_index_lock(dir.path()).unwrap().is_some(),
             "released lock must be acquirable again"
         );
+    }
+
+    #[test]
+    fn test_read_lock_does_not_create_missing_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = get_lock_path(dir.path());
+
+        assert!(try_acquire_index_read_lock(dir.path()).is_err());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_shared_and_exclusive_locks_block_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_lock_file(dir.path());
+
+        let read_guard = try_acquire_index_read_lock(dir.path())
+            .unwrap()
+            .expect("uncontended read lock must be acquired");
+        assert!(
+            try_acquire_index_read_lock(dir.path()).unwrap().is_some(),
+            "multiple readers must be allowed"
+        );
+        assert!(
+            try_acquire_index_lock(dir.path()).unwrap().is_none(),
+            "an exclusive writer must not acquire a held read lock"
+        );
+
+        drop(read_guard);
+        let writer_guard = try_acquire_index_lock(dir.path())
+            .unwrap()
+            .expect("writer must acquire after readers release");
+        assert!(
+            try_acquire_index_read_lock(dir.path()).unwrap().is_none(),
+            "a reader must not acquire a held exclusive lock"
+        );
+        drop(writer_guard);
+
+        assert!(
+            try_acquire_index_read_lock(dir.path()).unwrap().is_some(),
+            "reader must acquire after writer releases"
+        );
+    }
+
+    #[test]
+    fn test_blocking_exclusive_lock_waits_for_shared_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_lock_file(dir.path());
+        let read_guard = acquire_index_read_lock(dir.path()).unwrap();
+        let lock_path = get_lock_path(dir.path());
+        let dir_path = dir.path().to_path_buf();
+
+        let writer = std::thread::spawn(move || acquire_index_lock(&dir_path).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(
+            try_acquire_index_lock(dir.path()).unwrap().is_none(),
+            "exclusive acquisition must remain blocked while the reader is held"
+        );
+        drop(read_guard);
+        let writer_guard = writer.join().unwrap();
+        assert!(lock_path.exists());
+        drop(writer_guard);
     }
 
     #[test]

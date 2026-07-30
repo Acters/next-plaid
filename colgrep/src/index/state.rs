@@ -6,13 +6,26 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::paths::get_state_path;
+use super::paths::{get_state_path, get_vector_index_path};
 
 /// Version of the on-disk index format (chunk layout, embedding pipeline,
 /// metadata schema). Bump ONLY for incompatible changes: a mismatch discards
 /// the index and re-embeds the entire project on the next run. Routine CLI
 /// releases must NOT bump this.
 pub const INDEX_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexGeneration {
+    state: u64,
+    vector_metadata: Option<VectorMetadataStamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VectorMetadataStamp {
+    length: u64,
+    modified: u64,
+    content_hash: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexState {
@@ -62,6 +75,12 @@ impl FileInfo {
     }
 }
 
+fn append_generation_path(bytes: &mut Vec<u8>, path: &Path) {
+    let path = path.to_string_lossy();
+    bytes.extend_from_slice(&(path.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(path.as_bytes());
+}
+
 impl IndexState {
     /// Load state from the given index directory
     pub fn load(index_dir: &Path) -> Result<Self> {
@@ -101,6 +120,59 @@ impl IndexState {
         fs::write(&tmp_path, content)?;
         fs::rename(&tmp_path, &state_path)?;
         Ok(())
+    }
+
+    /// Return the state-only generation for the index contents described by
+    /// this state. Search counts and diagnostic CLI versions are intentionally
+    /// excluded, so ordinary CLI searches do not stale a read-only server.
+    pub fn generation(&self) -> IndexGeneration {
+        IndexGeneration {
+            state: self.state_generation(),
+            vector_metadata: None,
+        }
+    }
+
+    /// Return the persistent generation used by the server.
+    ///
+    /// The state file is not sufficient to identify a published vector index:
+    /// a full rebuild can replace `index/metadata.json` without changing the
+    /// tracked file map. Include the metadata file's size, mtime, and content
+    /// hash so that such a publication is detected before searching.
+    pub fn generation_with_index_dir(&self, index_dir: &Path) -> Result<IndexGeneration> {
+        let metadata_path = get_vector_index_path(index_dir).join("metadata.json");
+        let (modified, length) = file_stat(&metadata_path)?;
+        let content_hash = hash_file(&metadata_path)?;
+        Ok(IndexGeneration {
+            state: self.state_generation(),
+            vector_metadata: Some(VectorMetadataStamp {
+                length,
+                modified,
+                content_hash,
+            }),
+        })
+    }
+
+    fn state_generation(&self) -> u64 {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.index_format_version.to_le_bytes());
+        bytes.push(u8::from(self.dirty));
+
+        let mut files: Vec<_> = self.files.iter().collect();
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (path, info) in files {
+            append_generation_path(&mut bytes, path);
+            bytes.extend_from_slice(&info.content_hash.to_le_bytes());
+            bytes.extend_from_slice(&info.mtime.to_le_bytes());
+            bytes.extend_from_slice(&info.size.to_le_bytes());
+        }
+
+        let mut ignored_files: Vec<_> = self.ignored_files.iter().collect();
+        ignored_files.sort();
+        for path in ignored_files {
+            append_generation_path(&mut bytes, path);
+        }
+
+        xxh3_64(&bytes)
     }
 
     /// Increment the search count
@@ -366,6 +438,74 @@ mod tests {
         loaded.save(temp_dir.path()).unwrap();
         let reloaded = IndexState::load(temp_dir.path()).unwrap();
         assert_eq!(reloaded.search_count, 0);
+    }
+
+    #[test]
+    fn test_generation_excludes_search_count_but_tracks_index_fields() {
+        let mut state = IndexState {
+            index_format_version: INDEX_FORMAT_VERSION,
+            ..Default::default()
+        };
+        state.files.insert(
+            PathBuf::from("src/main.rs"),
+            FileInfo {
+                content_hash: 1,
+                mtime: 2,
+                size: 3,
+            },
+        );
+        let generation = state.generation();
+
+        state.search_count = 10;
+        assert_eq!(state.generation(), generation);
+
+        state
+            .files
+            .get_mut(&PathBuf::from("src/main.rs"))
+            .unwrap()
+            .size = 4;
+        assert_ne!(state.generation(), generation);
+
+        let changed_files_generation = state.generation();
+        state.ignored_files.insert(PathBuf::from("ignored.bin"));
+        assert_ne!(state.generation(), changed_files_generation);
+
+        state.dirty = true;
+        assert_ne!(state.generation(), changed_files_generation);
+    }
+
+    #[test]
+    fn test_generation_is_order_independent() {
+        let mut first = IndexState {
+            index_format_version: INDEX_FORMAT_VERSION,
+            ..Default::default()
+        };
+        first.files.insert(
+            PathBuf::from("b.rs"),
+            FileInfo {
+                content_hash: 2,
+                mtime: 2,
+                size: 2,
+            },
+        );
+        first.files.insert(
+            PathBuf::from("a.rs"),
+            FileInfo {
+                content_hash: 1,
+                mtime: 1,
+                size: 1,
+            },
+        );
+        first.ignored_files.insert(PathBuf::from("z.bin"));
+        first.ignored_files.insert(PathBuf::from("y.bin"));
+
+        let mut second = IndexState {
+            index_format_version: INDEX_FORMAT_VERSION,
+            ..Default::default()
+        };
+        second.files = first.files.clone();
+        second.ignored_files = first.ignored_files.clone();
+        assert_eq!(first.generation(), second.generation());
     }
 
     #[test]

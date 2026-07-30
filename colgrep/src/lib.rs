@@ -20,13 +20,15 @@ pub mod stderr;
 pub use config::{Config, DEFAULT_BATCH_SIZE, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_POOL_FACTOR};
 pub use embed::build_embedding_text;
 pub use index::paths::{
-    acquire_index_lock, find_parent_index, get_colgrep_data_dir, get_index_dir_for_project,
-    get_vector_index_path, ParentIndexInfo, ProjectMetadata,
+    acquire_index_lock, acquire_index_read_lock, find_parent_index, get_colgrep_data_dir,
+    get_index_dir_for_project, get_vector_index_path, try_acquire_index_read_lock, ParentIndexInfo,
+    ProjectMetadata,
 };
-pub use index::state::IndexState;
+pub use index::state::{IndexGeneration, IndexState, INDEX_FORMAT_VERSION};
 pub use index::{
-    bre_to_ere, escape_literal_braces, index_exists, path_contains_ignored_dir, IndexBuilder,
-    SearchResult, Searcher, UpdatePlan, UpdateStats, CONFIRMATION_THRESHOLD,
+    bre_to_ere, escape_literal_braces, index_exists, path_contains_ignored_dir,
+    prepare_glob_patterns, IndexBuilder, SearchResult, Searcher, UpdatePlan, UpdateStats,
+    CONFIRMATION_THRESHOLD, MAX_GLOB_EXPANSIONS, MAX_GLOB_PATTERNS,
 };
 pub use model::{ensure_model, DEFAULT_MODEL};
 pub use onnx_runtime::{ensure_onnx_runtime, is_cudnn_available};

@@ -43,6 +43,9 @@ EXAMPLES:
     colgrep init
     colgrep init ~/projects/myapp
 
+    # Serve an existing index over newline-delimited JSON stdio
+    colgrep serve --stdio
+
     # Check index status
     colgrep status
 
@@ -181,6 +184,17 @@ NOTES:
     • Incrementally updates the index if files changed
     • Useful for pre-warming the index before searching
     • Subsequent searches will be fast since the index is already built";
+
+pub const SERVE_HELP: &str = "\
+EXAMPLES:
+    # Serve newline-delimited JSON requests over stdin/stdout
+    colgrep serve --stdio
+    colgrep serve --stdio ./my-project --model lightonai/LateOn-Code-edge
+
+NOTES:
+    • Loads one existing project/model index at startup
+    • Never indexes or updates the project
+    • Stdout contains protocol JSON only; diagnostics go to stderr";
 
 pub const CONFIG_HELP: &str = "\
 EXAMPLES:
@@ -575,6 +589,22 @@ pub enum Commands {
         /// Skip the automatic index update and search the existing index as-is
         #[arg(long = "no-update")]
         no_update: bool,
+    },
+
+    /// Serve versioned newline-delimited JSON search requests
+    #[command(after_help = SERVE_HELP)]
+    Serve {
+        /// Enable the stdio JSON protocol (currently the only serve transport)
+        #[arg(long)]
+        stdio: bool,
+
+        /// Canonical project directory whose existing index will be loaded
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// ColBERT model HuggingFace ID or local path
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Show index status for a project

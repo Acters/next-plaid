@@ -219,10 +219,22 @@ colgrep --json "auth" | jq '.[] | .unit.file'
 | `colgrep clear`          | Clear index for current project        |
 | `colgrep clear --all`    | Clear all indexes                      |
 | `colgrep set-model <ID>` | Change the default ColBERT model       |
+| `colgrep serve --stdio`  | Reuse a loaded index over local NDJSON stdio |
 | `colgrep settings`       | View or modify configuration           |
 | `colgrep settings --ignore` | Add extra ignore patterns (persistent) |
 | `colgrep settings --force-include` | Force-include normally ignored paths |
 | `colgrep --stats`        | Show search statistics for all indexes |
+
+### Persistent local search
+
+Repeated CLI searches normally construct a new model and ONNX session. Local integrations can reuse one read-only search context through the versioned newline-delimited JSON protocol:
+
+```bash
+colgrep init /path/to/project
+colgrep serve --stdio /path/to/project
+```
+
+The server never listens on a network socket or updates the index. Stop it before `colgrep init`, then start a fresh process after the update. See [the stdio protocol documentation](../docs/stdio-server.md) for framing, request fields, limits, lifecycle, and error codes.
 
 ---
 

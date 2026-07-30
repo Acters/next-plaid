@@ -258,19 +258,52 @@ impl ResidualCodec {
     ///
     /// Centroid indices of shape `[N]`
     pub fn compress_into_codes(&self, embeddings: &Array2<f32>) -> Array1<usize> {
-        // Try CUDA acceleration if available
+        self.compress_into_codes_with_gpu_memory_budget(embeddings, None)
+            .expect("the default CUDA codec budget should not produce a configuration error")
+    }
+
+    /// Compress embeddings into centroid codes with an optional CUDA codec memory budget.
+    ///
+    /// `gpu_memory_budget_bytes` is a per-operation working-memory budget used only to
+    /// choose the CUDA compression batch size. It is not a process-wide VRAM limit and
+    /// does not affect query encoding. `None` preserves the existing 4 GiB CUDA default.
+    /// CPU compression ignores this value and keeps its existing behavior.
+    ///
+    /// Explicit CUDA budget/dimension validation errors are returned to the caller. Ordinary
+    /// CUDA operational failures keep the automatic CPU fallback, unless GPU execution is
+    /// forced, in which case the existing panic behavior is preserved.
+    pub(crate) fn compress_into_codes_with_gpu_memory_budget(
+        &self,
+        embeddings: &Array2<f32>,
+        gpu_memory_budget_bytes: Option<usize>,
+    ) -> Result<Array1<usize>> {
+        // Try CUDA acceleration if available.
         #[cfg(feature = "_cuda")]
-        {
+        if !crate::is_force_cpu() {
             let force_gpu = crate::is_force_gpu();
             if let Some(ctx) = crate::cuda::get_global_context() {
                 let centroids = self.centroids_view();
+                if let Some(budget) = gpu_memory_budget_bytes {
+                    crate::cuda::validate_compression_budget(
+                        &embeddings.view(),
+                        &centroids,
+                        budget,
+                        false,
+                    )?;
+                }
+
                 match crate::cuda::compress_into_codes_cuda_batched(
                     &ctx,
                     &embeddings.view(),
                     &centroids,
-                    None,
+                    gpu_memory_budget_bytes,
                 ) {
-                    Ok(codes) => return codes,
+                    Ok(codes) => return Ok(codes),
+                    Err(e)
+                        if gpu_memory_budget_bytes.is_some() && matches!(e, Error::Config(_)) =>
+                    {
+                        return Err(e);
+                    }
                     Err(e) => {
                         if force_gpu {
                             panic!(
@@ -289,7 +322,10 @@ impl ResidualCodec {
             }
         }
 
-        self.compress_into_codes_cpu(embeddings)
+        #[cfg(not(feature = "_cuda"))]
+        let _ = gpu_memory_budget_bytes;
+
+        Ok(self.compress_into_codes_cpu(embeddings))
     }
 
     /// CPU implementation of compress_into_codes.
@@ -660,6 +696,23 @@ mod tests {
         let codes = codec.compress_into_codes(&embeddings);
         assert_eq!(codes[0], 0);
         assert_eq!(codes[1], 2);
+    }
+
+    #[cfg(feature = "_cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn test_explicit_cuda_budget_validation_is_returned() {
+        crate::cuda::get_global_context().expect("requires an available CUDA device");
+        let centroids = Array2::zeros((4, 8));
+        let codec = ResidualCodec::new(2, centroids, Array1::zeros(8), None, None).unwrap();
+        let embeddings = Array2::zeros((1, 8));
+        let centroid_bytes = 4 * 8 * std::mem::size_of::<f32>();
+
+        let error = codec
+            .compress_into_codes_with_gpu_memory_budget(&embeddings, Some(centroid_bytes))
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("cannot hold one"));
     }
 
     #[test]

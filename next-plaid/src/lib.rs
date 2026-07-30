@@ -34,7 +34,9 @@ pub use delete::delete_from_index;
 pub use error::{Error, Result};
 pub use index::MmapIndex;
 pub use index::{
-    encode_index_chunk, prepare_codec_artifacts, write_index_from_encoded_chunks,
+    encode_index_chunk, encode_index_chunk_with_gpu_memory_budget,
+    preflight_codec_gpu_memory_budget, prepare_codec_artifacts,
+    prepare_codec_artifacts_with_gpu_memory_budget, write_index_from_encoded_chunks,
     EncodedIndexChunk, IndexConfig, Metadata, PreparedCodecArtifacts,
 };
 pub use kmeans::{

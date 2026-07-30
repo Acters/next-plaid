@@ -275,6 +275,7 @@ fn main() -> Result<()> {
             batch_size,
             encode_batch_size,
             index_chunk_size,
+            codec_gpu_memory_mb,
             static_batch,
         }) => cmd_init(
             &path,
@@ -286,6 +287,7 @@ fn main() -> Result<()> {
                 batch_size,
                 encode_batch_size,
                 index_chunk_size,
+                codec_gpu_memory_mb,
                 static_batch,
             },
         ),

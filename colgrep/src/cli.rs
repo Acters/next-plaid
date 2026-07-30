@@ -152,6 +152,16 @@ NOTES:
     • Model preference is stored in ~/.config/colgrep/config.json
     • Use 'colgrep settings' to view the current model";
 
+fn parse_positive_codec_gpu_memory_mb(raw: &str) -> Result<u64, String> {
+    let mib = raw
+        .parse::<u64>()
+        .map_err(|_| "must be a positive integer number of MiB".to_string())?;
+    if mib == 0 {
+        return Err("must be greater than zero MiB".to_string());
+    }
+    Ok(mib)
+}
+
 pub const INIT_HELP: &str = "\
 EXAMPLES:
     # Build or update index for the current directory
@@ -172,6 +182,9 @@ EXAMPLES:
     # Override outer encoding batch size for benchmarking/tuning
     colgrep init --encode-batch-size 1024
 
+    # Bound CUDA codec working memory for this indexing run (not a VRAM cap)
+    colgrep init --codec-gpu-memory-mb 256
+
     # Override outer index chunk size for benchmarking/tuning
     colgrep init --index-chunk-size 4096
 
@@ -182,6 +195,9 @@ EXAMPLES:
 NOTES:
     • Creates a new index if none exists
     • Incrementally updates the index if files changed
+    • --codec-gpu-memory-mb is a per-run CUDA codec working-memory budget, not a process-wide VRAM cap
+    • Omit --codec-gpu-memory-mb to preserve the 4 GiB CUDA codec default
+    • 256 MiB was validated experimentally, but is not the default
     • Useful for pre-warming the index before searching
     • Subsequent searches will be fast since the index is already built";
 
@@ -672,6 +688,14 @@ pub enum Commands {
         #[arg(long = "index-chunk-size", value_name = "SIZE")]
         index_chunk_size: Option<usize>,
 
+        /// Bound CUDA codec working memory for this indexing run (MiB; not a process-wide VRAM cap)
+        #[arg(
+            long = "codec-gpu-memory-mb",
+            value_name = "MIB",
+            value_parser = parse_positive_codec_gpu_memory_mb
+        )]
+        codec_gpu_memory_mb: Option<u64>,
+
         /// Use strict batch-size batching instead of fixed dynamic GPU batching
         #[arg(long = "static-batch")]
         static_batch: bool,
@@ -796,4 +820,52 @@ pub enum Commands {
         #[arg(long = "clear-force-include")]
         clear_force_include: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn codec_gpu_memory_cli_defaults_to_none() {
+        let cli = Cli::try_parse_from(["colgrep", "init"]).unwrap();
+        let Some(Commands::Init {
+            codec_gpu_memory_mb,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(codec_gpu_memory_mb, None);
+    }
+
+    #[test]
+    fn codec_gpu_memory_cli_parses_positive_mib() {
+        let cli = Cli::try_parse_from(["colgrep", "init", "--codec-gpu-memory-mb", "256"]).unwrap();
+        let Some(Commands::Init {
+            codec_gpu_memory_mb,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(codec_gpu_memory_mb, Some(256));
+    }
+
+    #[test]
+    fn codec_gpu_memory_cli_rejects_zero() {
+        let error = Cli::try_parse_from(["colgrep", "init", "--codec-gpu-memory-mb", "0"])
+            .err()
+            .expect("zero should be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn codec_gpu_memory_cli_rejects_non_integer() {
+        let error = Cli::try_parse_from(["colgrep", "init", "--codec-gpu-memory-mb", "1.5"])
+            .err()
+            .expect("non-integer should be rejected");
+        assert!(error.to_string().contains("positive integer"));
+    }
 }

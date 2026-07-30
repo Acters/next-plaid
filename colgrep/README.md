@@ -69,6 +69,7 @@ powershell -c "irm https://github.com/lightonai/next-plaid/releases/latest/downl
 colgrep init              # current directory
 colgrep init /path/to/project  # or a specific project
 colgrep init -y  # auto-confirm for large codebases (>10K code units)
+colgrep init --codec-gpu-memory-mb 256  # per-run CUDA codec working-memory budget
 ```
 
 **Search:**
@@ -161,6 +162,7 @@ colgrep settings --no-hybrid-search
 |      | `--model`           | Override ColBERT model                   |
 |      | `--no-pool`         | Disable embedding pooling                |
 |      | `--pool-factor`     | Set pool factor (default: 2)             |
+|      | `--codec-gpu-memory-mb` | `init` only: per-run CUDA codec working-memory budget (MiB) |
 
 ### Filtering
 
@@ -322,6 +324,15 @@ Default when unset (`--parallel 0`):
 On a CPU build, raising sessions speeds up cold indexing roughly linearly with cores at only
 a modest, bounded memory increase. On accelerator builds the trade-off is steeper, so the
 default stays at 1 — raise it explicitly with `--parallel` if you have the device memory.
+
+#### CUDA codec memory budget
+
+Use `colgrep init --codec-gpu-memory-mb <MIB>` to bound the CUDA codec's working-memory
+budget for that indexing run. This controls batch sizes for centroid-code and residual
+compression; it is **not** a process-wide VRAM cap, is not persisted in index identity, and
+does not affect query encoding. Omit it to preserve the existing 4 GiB CUDA default.
+The 256 MiB value was validated experimentally, but is not made the default. The value must
+be a positive integer and is converted to bytes with checked arithmetic.
 
 ### Binary Embedding Storage
 

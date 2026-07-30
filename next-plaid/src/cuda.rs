@@ -339,13 +339,170 @@ fn load_kernels(device: &Arc<CudarcContext>) -> Result<(CudaFunction, CudaFuncti
     Ok((argmax_func, gather_subtract_func))
 }
 
-/// Compute optimal batch size to stay within GPU memory budget.
-fn compute_batch_size(n: usize, k: usize, dim: usize, max_gpu_memory: usize) -> usize {
-    // Memory per row: embedding (dim*4) + scores (k*4) + code (4)
-    let bytes_per_row = dim * 4 + k * 4 + 4;
-    let fixed_memory = k * dim * 4; // centroids
-    let available = max_gpu_memory.saturating_sub(fixed_memory);
-    (available / bytes_per_row).clamp(1, n)
+const CUDA_API_MAX_DIMENSION: usize = i32::MAX as usize;
+const ARGMAX_BLOCK_SIZE: usize = 256;
+const ARGMAX_BLOCK_SIZE_U32: u32 = 256;
+
+#[derive(Debug)]
+struct CudaBatchPlan {
+    batch_size: usize,
+    k: i32,
+    dim: i32,
+}
+
+fn configuration_error(message: impl Into<String>) -> Error {
+    Error::Config(message.into())
+}
+
+fn checked_cuda_dimension(value: usize, name: &str) -> Result<i32> {
+    if value == 0 {
+        return Err(configuration_error(format!(
+            "CUDA codec {} must be greater than zero",
+            name
+        )));
+    }
+    i32::try_from(value).map_err(|_| {
+        configuration_error(format!(
+            "CUDA codec {} ({}) exceeds the CUDA API i32 limit",
+            name, value
+        ))
+    })
+}
+
+fn checked_cuda_grid_size(batch_n: usize) -> Result<u32> {
+    let grid_size = batch_n.div_ceil(ARGMAX_BLOCK_SIZE);
+    u32::try_from(grid_size).map_err(|_| {
+        configuration_error(format!(
+            "CUDA codec argmax grid size ({}) exceeds the CUDA API u32 limit",
+            grid_size
+        ))
+    })
+}
+
+/// Compute one checked CUDA batch plan for either centroid-only or fused residual compression.
+///
+/// The budget includes the resident centroid matrix and all per-row buffers. The returned
+/// batch size is capped to the i32 range required by cuBLAS and the kernels, even when the
+/// budget itself is usize::MAX. All arithmetic and API conversions are checked so no launch
+/// can receive a truncated dimension.
+fn compute_batch_plan(
+    n: usize,
+    k: usize,
+    dim: usize,
+    max_gpu_memory: usize,
+    include_residuals: bool,
+) -> Result<CudaBatchPlan> {
+    if max_gpu_memory == 0 {
+        return Err(configuration_error(
+            "CUDA codec memory budget must be greater than zero",
+        ));
+    }
+
+    let f32_bytes = std::mem::size_of::<f32>();
+    let embedding_bytes = dim.checked_mul(f32_bytes).ok_or_else(|| {
+        configuration_error("CUDA batch-size calculation overflowed for embedding dimensions")
+    })?;
+    let score_bytes = k.checked_mul(f32_bytes).ok_or_else(|| {
+        configuration_error("CUDA batch-size calculation overflowed for centroid scores")
+    })?;
+    // Memory per row: embedding + scores + code, plus residual for fused compression.
+    let bytes_per_row = embedding_bytes
+        .checked_add(score_bytes)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u32>()))
+        .and_then(|bytes| {
+            if include_residuals {
+                bytes.checked_add(embedding_bytes)
+            } else {
+                Some(bytes)
+            }
+        })
+        .ok_or_else(|| {
+            configuration_error("CUDA batch-size calculation overflowed per-row memory")
+        })?;
+    let fixed_memory = k
+        .checked_mul(dim)
+        .and_then(|elements| elements.checked_mul(f32_bytes))
+        .ok_or_else(|| {
+            configuration_error("CUDA batch-size calculation overflowed centroid memory")
+        })?;
+    let available = max_gpu_memory.checked_sub(fixed_memory).ok_or_else(|| {
+        configuration_error(format!(
+            "CUDA codec memory budget ({} bytes) is smaller than the {}-byte centroid matrix",
+            max_gpu_memory, fixed_memory
+        ))
+    })?;
+    let max_batch_by_memory = available / bytes_per_row;
+    if max_batch_by_memory == 0 {
+        return Err(configuration_error(format!(
+            "CUDA codec memory budget ({} bytes) cannot hold one compression row after the {}-byte centroid matrix",
+            max_gpu_memory, fixed_memory
+        )));
+    }
+
+    let k_i32 = checked_cuda_dimension(k, "centroid count")?;
+    let dim_i32 = checked_cuda_dimension(dim, "embedding dimension")?;
+    let batch_size = max_batch_by_memory.min(n).clamp(1, CUDA_API_MAX_DIMENSION);
+    Ok(CudaBatchPlan {
+        batch_size,
+        k: k_i32,
+        dim: dim_i32,
+    })
+}
+
+/// Centroid-score compression requires the embedding and centroid matrices to
+/// agree on the token dimension; a mismatch is a configuration error, not a
+/// CUDA operational failure.
+fn validate_embedding_centroid_dimensions(
+    embeddings: &ArrayView2<f32>,
+    centroids: &ArrayView2<f32>,
+) -> Result<()> {
+    if embeddings.ncols() != centroids.ncols() {
+        return Err(configuration_error(format!(
+            "CUDA codec embedding dimension ({}) does not match centroid dimension ({})",
+            embeddings.ncols(),
+            centroids.ncols()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate an explicit CUDA codec budget before attempting provider initialization.
+///
+/// This is crate-visible so the high-level codec API can return configuration errors rather
+/// than turning an invalid explicit budget into an automatic CPU fallback.
+pub(crate) fn validate_compression_budget(
+    embeddings: &ArrayView2<f32>,
+    centroids: &ArrayView2<f32>,
+    max_gpu_memory: usize,
+    include_residuals: bool,
+) -> Result<()> {
+    validate_embedding_centroid_dimensions(embeddings, centroids)?;
+    if embeddings.nrows() == 0 {
+        return Ok(());
+    }
+    validate_compression_budget_shape(
+        centroids.nrows(),
+        embeddings.ncols(),
+        max_gpu_memory,
+        include_residuals,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_compression_budget_shape(
+    num_centroids: usize,
+    embedding_dim: usize,
+    max_gpu_memory: usize,
+    include_residuals: bool,
+) -> Result<()> {
+    compute_batch_plan(
+        1,
+        num_centroids,
+        embedding_dim,
+        max_gpu_memory,
+        include_residuals,
+    )?;
+    Ok(())
 }
 
 /// CUDA-accelerated compress_into_codes with memory-efficient batching.
@@ -365,7 +522,9 @@ pub fn compress_into_codes_cuda_batched(
         return Ok(Array1::zeros(0));
     }
 
-    let batch_size = compute_batch_size(n, k, dim, max_mem);
+    validate_embedding_centroid_dimensions(embeddings, centroids)?;
+    let batch_plan = compute_batch_plan(n, k, dim, max_mem, false)?;
+    let batch_size = batch_plan.batch_size;
 
     // Ensure centroids are contiguous
     let centroids_cont = if centroids.is_standard_layout() {
@@ -385,7 +544,7 @@ pub fn compress_into_codes_cuda_batched(
     let mut all_codes = Vec::with_capacity(n);
 
     for batch_start in (0..n).step_by(batch_size) {
-        let batch_end = (batch_start + batch_size).min(n);
+        let batch_end = batch_start.saturating_add(batch_size).min(n);
         let batch_n = batch_end - batch_start;
 
         let batch = embeddings.slice(ndarray::s![batch_start..batch_end, ..]);
@@ -400,23 +559,32 @@ pub fn compress_into_codes_cuda_batched(
             .clone_htod(batch_cont.as_slice().unwrap())
             .map_err(|e| Error::Codec(format!("Failed to copy batch to GPU: {:?}", e)))?;
 
+        let score_elements = batch_n
+            .checked_mul(k)
+            .ok_or_else(|| configuration_error("CUDA score allocation size overflowed"))?;
         let mut scores_gpu: CudaSlice<f32> = ctx
             .stream
-            .alloc_zeros(batch_n * k)
+            .alloc_zeros(score_elements)
             .map_err(|e| Error::Codec(format!("Failed to allocate scores: {:?}", e)))?;
 
         // GEMM: scores = batch @ centroids.T
+        let batch_n_i32 = i32::try_from(batch_n).map_err(|_| {
+            configuration_error(format!(
+                "CUDA codec batch size ({}) exceeds i32 limit",
+                batch_n
+            ))
+        })?;
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_T,
             transb: cublasOperation_t::CUBLAS_OP_N,
-            m: k as i32,
-            n: batch_n as i32,
-            k: dim as i32,
+            m: batch_plan.k,
+            n: batch_n_i32,
+            k: batch_plan.dim,
             alpha: 1.0f32,
-            lda: dim as i32,
-            ldb: dim as i32,
+            lda: batch_plan.dim,
+            ldb: batch_plan.dim,
             beta: 0.0f32,
-            ldc: k as i32,
+            ldc: batch_plan.k,
         };
 
         unsafe {
@@ -430,15 +598,12 @@ pub fn compress_into_codes_cuda_batched(
             .alloc_zeros(batch_n)
             .map_err(|e| Error::Codec(format!("Failed to allocate codes: {:?}", e)))?;
 
-        let block_size = 256;
-        let grid_size = batch_n.div_ceil(block_size);
+        let grid_size = checked_cuda_grid_size(batch_n)?;
         let launch_cfg = LaunchConfig {
-            block_dim: (block_size as u32, 1, 1),
-            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (ARGMAX_BLOCK_SIZE_U32, 1, 1),
+            grid_dim: (grid_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let batch_n_i32 = batch_n as i32;
-        let k_i32 = k as i32;
 
         unsafe {
             ctx.stream
@@ -446,7 +611,7 @@ pub fn compress_into_codes_cuda_batched(
                 .arg(&scores_gpu)
                 .arg(&mut codes_gpu)
                 .arg(&batch_n_i32)
-                .arg(&k_i32)
+                .arg(&batch_plan.k)
                 .launch(launch_cfg)
                 .map_err(|e| Error::Codec(format!("Argmax kernel failed: {:?}", e)))?;
         }
@@ -460,20 +625,6 @@ pub fn compress_into_codes_cuda_batched(
     }
 
     Ok(Array1::from_vec(all_codes))
-}
-
-/// Compute optimal batch size for fused compress+residuals to stay within GPU memory.
-fn compute_batch_size_with_residuals(
-    n: usize,
-    k: usize,
-    dim: usize,
-    max_gpu_memory: usize,
-) -> usize {
-    // Memory per row: embedding (dim*4) + scores (k*4) + code (4) + residual (dim*4)
-    let bytes_per_row = dim * 4 + k * 4 + 4 + dim * 4;
-    let fixed_memory = k * dim * 4; // centroids
-    let available = max_gpu_memory.saturating_sub(fixed_memory);
-    (available / bytes_per_row).clamp(1, n)
 }
 
 /// CUDA-accelerated fused compress_into_codes + residual computation.
@@ -508,7 +659,9 @@ pub fn compress_and_residuals_cuda_batched(
         return Ok((Array1::zeros(0), ndarray::Array2::zeros((0, dim))));
     }
 
-    let batch_size = compute_batch_size_with_residuals(n, k, dim, max_mem);
+    validate_embedding_centroid_dimensions(embeddings, centroids)?;
+    let batch_plan = compute_batch_plan(n, k, dim, max_mem, true)?;
+    let batch_size = batch_plan.batch_size;
 
     // Ensure centroids are contiguous
     let centroids_cont = if centroids.is_standard_layout() {
@@ -529,7 +682,7 @@ pub fn compress_and_residuals_cuda_batched(
     let mut all_residuals = ndarray::Array2::<f32>::zeros((n, dim));
 
     for batch_start in (0..n).step_by(batch_size) {
-        let batch_end = (batch_start + batch_size).min(n);
+        let batch_end = batch_start.saturating_add(batch_size).min(n);
         let batch_n = batch_end - batch_start;
 
         let batch = embeddings.slice(ndarray::s![batch_start..batch_end, ..]);
@@ -545,23 +698,32 @@ pub fn compress_and_residuals_cuda_batched(
             .map_err(|e| Error::Codec(format!("Failed to copy batch to GPU: {:?}", e)))?;
 
         // Allocate GPU memory for scores and codes
+        let score_elements = batch_n
+            .checked_mul(k)
+            .ok_or_else(|| configuration_error("CUDA score allocation size overflowed"))?;
         let mut scores_gpu: CudaSlice<f32> = ctx
             .stream
-            .alloc_zeros(batch_n * k)
+            .alloc_zeros(score_elements)
             .map_err(|e| Error::Codec(format!("Failed to allocate scores: {:?}", e)))?;
 
         // GEMM: scores = batch @ centroids.T
+        let batch_n_i32 = i32::try_from(batch_n).map_err(|_| {
+            configuration_error(format!(
+                "CUDA codec batch size ({}) exceeds i32 limit",
+                batch_n
+            ))
+        })?;
         let cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_T,
             transb: cublasOperation_t::CUBLAS_OP_N,
-            m: k as i32,
-            n: batch_n as i32,
-            k: dim as i32,
+            m: batch_plan.k,
+            n: batch_n_i32,
+            k: batch_plan.dim,
             alpha: 1.0f32,
-            lda: dim as i32,
-            ldb: dim as i32,
+            lda: batch_plan.dim,
+            ldb: batch_plan.dim,
             beta: 0.0f32,
-            ldc: k as i32,
+            ldc: batch_plan.k,
         };
 
         unsafe {
@@ -576,15 +738,12 @@ pub fn compress_and_residuals_cuda_batched(
             .alloc_zeros(batch_n)
             .map_err(|e| Error::Codec(format!("Failed to allocate codes: {:?}", e)))?;
 
-        let block_size = 256;
-        let grid_size = batch_n.div_ceil(block_size);
+        let grid_size = checked_cuda_grid_size(batch_n)?;
         let argmax_cfg = LaunchConfig {
-            block_dim: (block_size as u32, 1, 1),
-            grid_dim: (grid_size as u32, 1, 1),
+            block_dim: (ARGMAX_BLOCK_SIZE_U32, 1, 1),
+            grid_dim: (grid_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let batch_n_i32 = batch_n as i32;
-        let k_i32 = k as i32;
 
         unsafe {
             ctx.stream
@@ -592,7 +751,7 @@ pub fn compress_and_residuals_cuda_batched(
                 .arg(&scores_gpu)
                 .arg(&mut codes_gpu)
                 .arg(&batch_n_i32)
-                .arg(&k_i32)
+                .arg(&batch_plan.k)
                 .launch(argmax_cfg)
                 .map_err(|e| Error::Codec(format!("Argmax kernel failed: {:?}", e)))?;
         }
@@ -601,19 +760,31 @@ pub fn compress_and_residuals_cuda_batched(
         drop(scores_gpu);
 
         // Compute residuals: residuals = embeddings - centroids[codes]
+        let residual_elements = batch_n
+            .checked_mul(dim)
+            .ok_or_else(|| configuration_error("CUDA residual allocation size overflowed"))?;
         let mut residuals_gpu: CudaSlice<f32> = ctx
             .stream
-            .alloc_zeros(batch_n * dim)
+            .alloc_zeros(residual_elements)
             .map_err(|e| Error::Codec(format!("Failed to allocate residuals: {:?}", e)))?;
 
         // For gather_subtract: one block per row, threads parallelize over dimensions
-        let threads_per_row = dim.min(256);
+        let threads_per_row = dim.min(ARGMAX_BLOCK_SIZE);
+        let threads_per_row = u32::try_from(threads_per_row).map_err(|_| {
+            configuration_error("CUDA gather-subtract block dimension exceeds u32 limit")
+        })?;
+        let batch_grid_size = u32::try_from(batch_n).map_err(|_| {
+            configuration_error(format!(
+                "CUDA gather-subtract grid size ({}) exceeds u32 limit",
+                batch_n
+            ))
+        })?;
         let gather_cfg = LaunchConfig {
-            block_dim: (threads_per_row as u32, 1, 1),
-            grid_dim: (batch_n as u32, 1, 1),
+            block_dim: (threads_per_row, 1, 1),
+            grid_dim: (batch_grid_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let dim_i32 = dim as i32;
+        let dim_i32 = batch_plan.dim;
 
         unsafe {
             ctx.stream
@@ -660,12 +831,70 @@ mod tests {
     use ndarray_rand::RandomExt;
 
     #[test]
+    #[ignore = "requires an available CUDA device"]
     fn test_cuda_context() {
         let ctx = CudaContext::new(0);
         assert!(ctx.is_ok(), "Failed to create CUDA context");
     }
 
     #[test]
+    fn test_compute_batch_plan_is_deterministic() {
+        let budget = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            compute_batch_plan(100, 64, 128, budget, false)
+                .unwrap()
+                .batch_size,
+            100
+        );
+        assert_eq!(
+            compute_batch_plan(100, 64, 128, budget, true)
+                .unwrap()
+                .batch_size,
+            100
+        );
+
+        let fixed = 4 * 8 * std::mem::size_of::<f32>();
+        let per_row = 8 * std::mem::size_of::<f32>()
+            + 4 * std::mem::size_of::<f32>()
+            + std::mem::size_of::<u32>();
+        assert_eq!(
+            compute_batch_plan(100, 4, 8, fixed + per_row * 3, false)
+                .unwrap()
+                .batch_size,
+            3
+        );
+    }
+
+    #[test]
+    fn test_compute_batch_plan_rejects_configuration_errors() {
+        let overflow = compute_batch_plan(1, 1, usize::MAX, usize::MAX, false);
+        assert!(matches!(&overflow, Err(Error::Config(_))));
+        assert!(overflow.unwrap_err().to_string().contains("overflowed"));
+
+        let too_small = compute_batch_plan(1, 4, 8, 4 * 8 * std::mem::size_of::<f32>(), false);
+        assert!(matches!(&too_small, Err(Error::Config(_))));
+        assert!(too_small
+            .unwrap_err()
+            .to_string()
+            .contains("cannot hold one"));
+
+        let dimension_limit = compute_batch_plan(1, i32::MAX as usize + 1, 8, usize::MAX, false);
+        assert!(matches!(dimension_limit, Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn test_compute_batch_plan_caps_batch_to_i32_limit() {
+        let plan = compute_batch_plan(usize::MAX, 1, 1, usize::MAX, false).unwrap();
+        assert_eq!(plan.batch_size, i32::MAX as usize);
+        assert_eq!(checked_cuda_grid_size(plan.batch_size).unwrap(), 8_388_608);
+        assert!(matches!(
+            checked_cuda_grid_size(usize::MAX),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires an available CUDA device"]
     fn test_compress_into_codes_cuda() {
         let ctx = CudaContext::new(0).expect("No CUDA");
         let embeddings = Array2::random((1000, 128), Uniform::new(-1.0f32, 1.0));
@@ -679,5 +908,45 @@ mod tests {
         for &code in codes.iter() {
             assert!(code < 64);
         }
+    }
+
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn test_cuda_multi_batch_matches_unbounded_output() {
+        let ctx = CudaContext::new(0).expect("No CUDA");
+        let embeddings = Array2::random((257, 128), Uniform::new(-1.0f32, 1.0));
+        let centroids = Array2::random((64, 128), Uniform::new(-1.0f32, 1.0));
+
+        let fixed = 64 * 128 * std::mem::size_of::<f32>();
+        let residual_row = 128 * std::mem::size_of::<f32>()
+            + 64 * std::mem::size_of::<f32>()
+            + std::mem::size_of::<u32>()
+            + 128 * std::mem::size_of::<f32>();
+        let bounded_budget = fixed + residual_row * 7;
+
+        let unbounded_codes =
+            compress_into_codes_cuda_batched(&ctx, &embeddings.view(), &centroids.view(), None)
+                .expect("CUDA failed");
+        let bounded_codes = compress_into_codes_cuda_batched(
+            &ctx,
+            &embeddings.view(),
+            &centroids.view(),
+            Some(bounded_budget),
+        )
+        .expect("CUDA failed");
+        assert_eq!(bounded_codes, unbounded_codes);
+
+        let (unbounded_codes, unbounded_residuals) =
+            compress_and_residuals_cuda_batched(&ctx, &embeddings.view(), &centroids.view(), None)
+                .expect("CUDA failed");
+        let (bounded_codes, bounded_residuals) = compress_and_residuals_cuda_batched(
+            &ctx,
+            &embeddings.view(),
+            &centroids.view(),
+            Some(bounded_budget),
+        )
+        .expect("CUDA failed");
+        assert_eq!(bounded_codes, unbounded_codes);
+        assert_eq!(bounded_residuals, unbounded_residuals);
     }
 }

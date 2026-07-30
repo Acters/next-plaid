@@ -13,7 +13,33 @@ pub struct InitOptions<'a> {
     pub batch_size: Option<usize>,
     pub encode_batch_size: Option<usize>,
     pub index_chunk_size: Option<usize>,
+    pub codec_gpu_memory_mb: Option<u64>,
     pub static_batch: bool,
+}
+
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+fn codec_gpu_memory_budget_bytes(codec_gpu_memory_mb: Option<u64>) -> Result<Option<usize>> {
+    let Some(mib) = codec_gpu_memory_mb else {
+        return Ok(None);
+    };
+    if mib == 0 {
+        anyhow::bail!("--codec-gpu-memory-mb must be greater than zero MiB");
+    }
+    let bytes = mib.checked_mul(BYTES_PER_MIB).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--codec-gpu-memory-mb={} is too large: MiB-to-byte conversion overflowed",
+            mib
+        )
+    })?;
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "--codec-gpu-memory-mb={} is too large: {} bytes cannot be represented on this platform",
+            mib,
+            bytes
+        )
+    })?;
+    Ok(Some(bytes))
 }
 
 fn resolve_index_runtime_overrides(
@@ -39,6 +65,7 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     let config = Config::load().unwrap_or_default();
     let model = resolve_model(&config, options.cli_model);
     let pool_factor = resolve_pool_factor(&config, options.pool_factor, options.no_pool);
+    let codec_gpu_memory_budget_bytes = codec_gpu_memory_budget_bytes(options.codec_gpu_memory_mb)?;
 
     let quantized = !config.use_fp32();
     let (parallel_sessions, batch_size) =
@@ -68,6 +95,9 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     )?;
     builder.set_auto_confirm(options.auto_confirm);
     builder.set_dynamic_batch(!options.static_batch);
+    if let Some(codec_gpu_memory_budget_bytes) = codec_gpu_memory_budget_bytes {
+        builder.set_codec_gpu_memory_budget_bytes(codec_gpu_memory_budget_bytes)?;
+    }
     if let Some(encode_batch_size) = options.encode_batch_size {
         builder.set_encode_batch_size(encode_batch_size.max(1));
     }
@@ -112,6 +142,7 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_resolve_index_runtime_overrides_preserves_explicit_values() {
@@ -149,5 +180,50 @@ mod tests {
 
         assert_eq!(parallel_sessions, Some(1));
         assert_eq!(batch_size, Some(1));
+    }
+
+    #[test]
+    fn test_codec_gpu_memory_budget_bytes_defaults_to_none() {
+        assert_eq!(codec_gpu_memory_budget_bytes(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_codec_gpu_memory_budget_bytes_converts_checked_mib() {
+        assert_eq!(
+            codec_gpu_memory_budget_bytes(Some(256)).unwrap(),
+            Some(256 * 1024 * 1024)
+        );
+        let error = codec_gpu_memory_budget_bytes(Some(u64::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conversion overflowed"));
+    }
+
+    #[test]
+    fn test_codec_gpu_memory_cli_max_u64_is_rejected_by_checked_conversion() {
+        let cli = crate::cli::Cli::try_parse_from([
+            "colgrep",
+            "init",
+            "--codec-gpu-memory-mb",
+            &u64::MAX.to_string(),
+        ])
+        .unwrap();
+        let Some(crate::cli::Commands::Init {
+            codec_gpu_memory_mb,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(codec_gpu_memory_mb, Some(u64::MAX));
+        assert!(codec_gpu_memory_budget_bytes(codec_gpu_memory_mb).is_err());
+    }
+
+    #[test]
+    fn test_codec_gpu_memory_budget_bytes_rejects_zero() {
+        let error = codec_gpu_memory_budget_bytes(Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("greater than zero"));
     }
 }

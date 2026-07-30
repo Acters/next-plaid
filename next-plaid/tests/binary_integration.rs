@@ -254,3 +254,277 @@ fn encode_index_chunk_binary_packs_signs_with_ivf_codes() {
         .collect();
     assert_eq!(chunk.codes.to_vec(), want_codes);
 }
+
+#[cfg(feature = "_cuda")]
+mod cuda_codec_budget_tests {
+    use super::*;
+
+    fn bounded_budget(dim: usize, num_centroids: usize) -> usize {
+        let fixed = num_centroids * dim * std::mem::size_of::<f32>();
+        let row = dim * std::mem::size_of::<f32>()
+            + num_centroids * std::mem::size_of::<f32>()
+            + std::mem::size_of::<u32>()
+            + dim * std::mem::size_of::<f32>();
+        fixed + row * 3
+    }
+
+    fn assert_cuda_available() {
+        next_plaid::cuda::get_global_context().expect("requires an available CUDA device");
+    }
+
+    /// Every file in an index directory, name-sorted, for byte-exact comparison
+    /// of two index artifacts or of one directory before and after an operation.
+    fn snapshot_index_dir(dir: &TempDir) -> Vec<(String, Vec<u8>)> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Bounded multi-batch append to a small residual index: the returned IDs
+    /// and document counts must be correct, and every persisted artifact must
+    /// byte-match an unbounded control append of the same documents.
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn update_append_with_gpu_memory_budget_matches_unbounded_multi_batch() {
+        use next_plaid::Metadata;
+
+        assert_cuda_available();
+        let all = random_docs(16, 8, 64);
+        let (docs, more) = all.split_at(10);
+
+        let bounded_dir = TempDir::new().unwrap();
+        let control_dir = TempDir::new().unwrap();
+        let bounded_path = bounded_dir.path().to_str().unwrap();
+        let control_path = control_dir.path().to_str().unwrap();
+        // CPU k-means keeps codec creation deterministic and identical across
+        // both dirs; the appended compression is the GPU path under test.
+        let create_config = IndexConfig {
+            force_cpu: true,
+            ..config(false)
+        };
+        MmapIndex::create_with_kmeans(docs, bounded_path, &create_config).unwrap();
+        MmapIndex::create_with_kmeans(docs, control_path, &create_config).unwrap();
+
+        // Budget for ~3 compression rows per batch: 48 appended tokens force
+        // well over a dozen CUDA batches (the unbounded control uses one).
+        let metadata = Metadata::load_from_path(bounded_dir.path()).unwrap();
+        let budget = bounded_budget(metadata.embedding_dim, metadata.num_partitions);
+
+        let update_config = next_plaid::update::UpdateConfig::default();
+        let bounded_ids = MmapIndex::update_append_with_gpu_memory_budget(
+            more,
+            bounded_path,
+            &update_config,
+            Some(budget),
+        )
+        .unwrap();
+        let control_ids = MmapIndex::update_append(more, control_path, &update_config).unwrap();
+
+        let want_ids: Vec<i64> = (10..16).collect();
+        assert_eq!(bounded_ids, want_ids);
+        assert_eq!(control_ids, want_ids);
+
+        assert_eq!(
+            snapshot_index_dir(&bounded_dir),
+            snapshot_index_dir(&control_dir),
+            "bounded append artifacts diverged from the unbounded control"
+        );
+
+        let reloaded = Metadata::load_from_path(bounded_dir.path()).unwrap();
+        assert_eq!(reloaded.num_documents, 16);
+        assert_eq!(reloaded.num_embeddings, 16 * 8);
+        assert_eq!(reloaded.avg_doclen, 8.0);
+    }
+
+    /// An undersized budget must propagate as `Error::Config` and leave the
+    /// index metadata and artifacts byte-identical.
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn update_append_with_gpu_memory_budget_config_error_leaves_index_unchanged() {
+        assert_cuda_available();
+        let all = random_docs(14, 8, 64);
+        let (docs, more) = all.split_at(10);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let create_config = IndexConfig {
+            force_cpu: true,
+            ..config(false)
+        };
+        MmapIndex::create_with_kmeans(docs, path, &create_config).unwrap();
+        let before = snapshot_index_dir(&dir);
+
+        // 1 byte is smaller than the resident centroid matrix: validation must
+        // fail before any chunk write.
+        let error = MmapIndex::update_append_with_gpu_memory_budget(
+            more,
+            path,
+            &next_plaid::update::UpdateConfig::default(),
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, next_plaid::Error::Config(_)),
+            "expected the undersized budget to propagate as Error::Config, got: {error}"
+        );
+
+        assert_eq!(
+            snapshot_index_dir(&dir),
+            before,
+            "failed append mutated index metadata or artifacts"
+        );
+    }
+
+    /// Successful initial-create public path under a bounded multi-batch CUDA
+    /// budget: preflight → codec artifacts → encode chunk → write index files,
+    /// then validate the resulting metadata and artifacts against an unbounded
+    /// control run and through `MmapIndex::load`.
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn initial_index_public_path_with_gpu_memory_budget_matches_unbounded() {
+        use next_plaid::Metadata;
+
+        assert_cuda_available();
+        let docs = random_docs(12, 8, 64);
+        let total_tokens: usize = docs.iter().map(|d| d.nrows()).sum();
+
+        // Deterministic CPU k-means so the bounded and unbounded runs share
+        // the exact same codec inputs.
+        let centroids = next_plaid::compute_kmeans(
+            &docs,
+            &next_plaid::kmeans::ComputeKmeansConfig {
+                seed: 42,
+                num_partitions: Some(16),
+                force_cpu: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cfg = config(false);
+
+        // Preflight validates the heuristic codec shape (which can exceed the
+        // explicit 16 centroids), so size the budget for the larger of the two
+        // while still forcing ~3 compression rows per CUDA batch.
+        let preflight_centroids =
+            next_plaid::kmeans::estimate_num_partitions(&docs).min(total_tokens);
+        let budget = bounded_budget(64, preflight_centroids.max(16));
+
+        let run_public_path = |budget: Option<usize>, dir: &TempDir| -> Metadata {
+            let path = dir.path().to_str().unwrap();
+            next_plaid::preflight_codec_gpu_memory_budget(&docs, false, false, budget).unwrap();
+            let artifacts = next_plaid::prepare_codec_artifacts_with_gpu_memory_budget(
+                &docs,
+                centroids.clone(),
+                &cfg,
+                budget,
+            )
+            .unwrap();
+            let chunk = next_plaid::encode_index_chunk_with_gpu_memory_budget(
+                &docs,
+                &artifacts.codec,
+                false,
+                false,
+                budget,
+            )
+            .unwrap();
+            next_plaid::write_index_from_encoded_chunks(&[chunk], &artifacts, path, &cfg).unwrap()
+        };
+
+        let bounded_dir = TempDir::new().unwrap();
+        let control_dir = TempDir::new().unwrap();
+        let bounded_metadata = run_public_path(Some(budget), &bounded_dir);
+        run_public_path(None, &control_dir);
+
+        assert_eq!(bounded_metadata.num_chunks, 1);
+        assert_eq!(bounded_metadata.num_documents, 12);
+        assert_eq!(bounded_metadata.num_embeddings, total_tokens);
+        assert_eq!(bounded_metadata.avg_doclen, 8.0);
+        assert!(!bounded_metadata.binary);
+
+        assert_eq!(
+            snapshot_index_dir(&bounded_dir),
+            snapshot_index_dir(&control_dir),
+            "bounded initial create artifacts diverged from the unbounded control"
+        );
+
+        let index = MmapIndex::load(bounded_dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(index.num_documents(), 12);
+    }
+
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn encode_index_chunk_with_gpu_memory_budget_binary_matches_legacy_multi_batch() {
+        assert_cuda_available();
+        let docs = random_docs(10, 8, 64);
+        let centroids = next_plaid::compute_kmeans(
+            &docs,
+            &next_plaid::kmeans::ComputeKmeansConfig {
+                seed: 42,
+                num_partitions: Some(16),
+                force_cpu: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let artifacts =
+            next_plaid::prepare_codec_artifacts(&docs, centroids, &config(true)).unwrap();
+        let budget = bounded_budget(64, artifacts.codec.num_centroids());
+
+        let legacy = next_plaid::encode_index_chunk(&docs, &artifacts.codec, false, true).unwrap();
+        let bounded = next_plaid::encode_index_chunk_with_gpu_memory_budget(
+            &docs,
+            &artifacts.codec,
+            false,
+            true,
+            Some(budget),
+        )
+        .unwrap();
+
+        assert_eq!(bounded.codes, legacy.codes);
+        assert_eq!(bounded.residuals, legacy.residuals);
+        assert_eq!(bounded.doclens, legacy.doclens);
+    }
+
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn encode_index_chunk_with_gpu_memory_budget_residual_matches_legacy_multi_batch() {
+        assert_cuda_available();
+        let docs = random_docs(10, 8, 64);
+        let centroids = next_plaid::compute_kmeans(
+            &docs,
+            &next_plaid::kmeans::ComputeKmeansConfig {
+                seed: 42,
+                num_partitions: Some(16),
+                force_cpu: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let artifacts =
+            next_plaid::prepare_codec_artifacts(&docs, centroids, &config(false)).unwrap();
+        let budget = bounded_budget(64, artifacts.codec.num_centroids());
+
+        let legacy = next_plaid::encode_index_chunk(&docs, &artifacts.codec, false, false).unwrap();
+        let bounded = next_plaid::encode_index_chunk_with_gpu_memory_budget(
+            &docs,
+            &artifacts.codec,
+            false,
+            false,
+            Some(budget),
+        )
+        .unwrap();
+
+        assert_eq!(bounded.codes, legacy.codes);
+        assert_eq!(bounded.residuals, legacy.residuals);
+        assert_eq!(bounded.doclens, legacy.doclens);
+    }
+}

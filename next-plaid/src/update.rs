@@ -776,6 +776,30 @@ pub fn update_index(
     update_threshold: bool,
     force_cpu: bool,
 ) -> Result<usize> {
+    update_index_with_gpu_memory_budget(
+        embeddings,
+        index_path,
+        codec,
+        batch_size,
+        update_threshold,
+        force_cpu,
+        None,
+    )
+}
+
+/// Update an existing index with an optional CUDA codec working-memory budget.
+///
+/// The budget is applied to centroid-code compression during incremental updates.
+/// `None` preserves the existing 4 GiB CUDA default; CPU behavior is unchanged.
+pub(crate) fn update_index_with_gpu_memory_budget(
+    embeddings: &[Array2<f32>],
+    index_path: &str,
+    codec: &ResidualCodec,
+    batch_size: Option<usize>,
+    update_threshold: bool,
+    force_cpu: bool,
+    codec_gpu_memory_budget_bytes: Option<usize>,
+) -> Result<usize> {
     emit_update_progress("index_write", "writing index chunks");
     let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
     let index_dir = Path::new(index_path);
@@ -871,7 +895,10 @@ pub fn update_index(
         let batch_codes = if force_cpu {
             codec.compress_into_codes_cpu(&batch_embeddings)
         } else {
-            codec.compress_into_codes(&batch_embeddings)
+            codec.compress_into_codes_with_gpu_memory_budget(
+                &batch_embeddings,
+                codec_gpu_memory_budget_bytes,
+            )?
         };
 
         // BATCH: Compute residuals using parallel subtraction

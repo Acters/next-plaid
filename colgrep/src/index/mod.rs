@@ -13,7 +13,8 @@ use ignore::gitignore::GitignoreBuilder;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use next_plaid::{
-    delete_from_index, encode_index_chunk, filtering, prepare_codec_artifacts,
+    delete_from_index, encode_index_chunk_with_gpu_memory_budget, filtering,
+    preflight_codec_gpu_memory_budget, prepare_codec_artifacts_with_gpu_memory_budget,
     write_index_from_encoded_chunks, EncodedIndexChunk, IndexConfig, Metadata, MmapIndex,
     SearchParameters, UpdateConfig,
 };
@@ -245,6 +246,15 @@ const LARGE_BATCH_POOL_FACTOR: usize = 2;
 
 const DEFAULT_ENCODE_BATCH_SIZE: usize = 64;
 
+#[cfg(feature = "_cuda")]
+fn contains_codec_config_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<next_plaid::Error>()
+            .is_some_and(|error| matches!(error, next_plaid::Error::Config(_)))
+    })
+}
+
 /// Threshold for forcing CPU encoding even when CUDA is available.
 /// For small batches (< this many units), CPU is faster due to GPU initialization overhead.
 #[cfg(feature = "_cuda")]
@@ -444,6 +454,8 @@ struct ChunkPipelineConfig<'a> {
     index_path: &'a str,
     config: IndexConfig,
     update_config: UpdateConfig,
+    /// Transient CUDA codec budget; deliberately kept outside next-plaid's public configs.
+    codec_gpu_memory_budget_bytes: Option<usize>,
     pb: Option<&'a ProgressBar>,
 }
 
@@ -623,13 +635,14 @@ fn run_pool_stage(
 ///   While k-means runs, subsequent chunks are buffered in a coding channel. Once centroids
 ///   are ready, all chunks are compressed and written in one batch — producing a single
 ///   contiguous index file rather than incremental updates.
-/// - **Update**: Each chunk is appended to the existing index via `update_or_create`.
+/// - **Update**: Each chunk is appended to the existing index via `update_append`.
 fn run_index_stage(
     receiver: mpsc::Receiver<PooledChunkForIndex>,
     sender: mpsc::SyncSender<IndexedChunkForMetadata>,
     index_path: String,
     config: IndexConfig,
     update_config: UpdateConfig,
+    codec_gpu_memory_budget_bytes: Option<usize>,
     initial_kmeans_sample_docs: usize,
 ) -> Result<()> {
     let initial_create = !Path::new(&index_path).join("metadata.json").exists();
@@ -646,6 +659,14 @@ fn run_index_stage(
         if initial_create_config.n_samples_kmeans.is_none() {
             initial_create_config.n_samples_kmeans = Some(initial_kmeans_sample_docs.max(1));
         }
+
+        // Validate the codec shape before any index or metadata stage side effects.
+        preflight_codec_gpu_memory_budget(
+            &first_chunk.embeddings,
+            initial_create_config.force_cpu,
+            initial_create_config.binary,
+            codec_gpu_memory_budget_bytes,
+        )?;
 
         // Spawn k-means in a background thread so encoding can continue in parallel.
         // The coding thread blocks on the k-means result before compressing any chunks.
@@ -665,10 +686,11 @@ fn run_index_stage(
                         force_cpu: kmeans_config.force_cpu,
                     },
                 )?;
-                Ok(prepare_codec_artifacts(
+                Ok(prepare_codec_artifacts_with_gpu_memory_budget(
                     &sample_embeddings,
                     centroids,
                     &kmeans_config,
+                    codec_gpu_memory_budget_bytes,
                 )?)
             })
             .context("Failed to spawn kmeans stage thread")?;
@@ -689,11 +711,12 @@ fn run_index_stage(
                     .map_err(|_| anyhow::anyhow!("K-means stage thread panicked"))??;
                 let mut encoded_chunks: Vec<EncodedIndexChunk> = Vec::new();
                 while let Ok(chunk) = dedup_rx.recv() {
-                    let encoded = encode_index_chunk(
+                    let encoded = encode_index_chunk_with_gpu_memory_budget(
                         &chunk.embeddings,
                         &codec_artifacts.codec,
                         coding_force_cpu,
                         coding_config.binary,
+                        codec_gpu_memory_budget_bytes,
                     )?;
                     encoded_chunks.push(encoded);
                 }
@@ -758,8 +781,8 @@ fn run_index_stage(
                 &mut pending_embeddings,
                 &sender,
                 &index_path,
-                &config,
                 &update_config,
+                codec_gpu_memory_budget_bytes,
             )?;
         }
     }
@@ -769,8 +792,8 @@ fn run_index_stage(
         &mut pending_embeddings,
         &sender,
         &index_path,
-        &config,
         &update_config,
+        codec_gpu_memory_budget_bytes,
     )?;
 
     Ok(())
@@ -783,21 +806,23 @@ fn flush_update_batch(
     embeddings: &mut Vec<ndarray::Array2<f32>>,
     sender: &mpsc::SyncSender<IndexedChunkForMetadata>,
     index_path: &str,
-    config: &IndexConfig,
     update_config: &UpdateConfig,
+    codec_gpu_memory_budget_bytes: Option<usize>,
 ) -> Result<()> {
     if embeddings.is_empty() {
         return Ok(());
     }
 
     let _guard = CriticalSectionGuard::new();
-    let index_exists = Path::new(index_path).join("metadata.json").exists();
-    let doc_ids = if index_exists {
-        MmapIndex::update_append(embeddings, index_path, update_config)?
-    } else {
-        let (_, ids) = MmapIndex::update_or_create(embeddings, index_path, config, update_config)?;
-        ids
-    };
+    if !Path::new(index_path).join("metadata.json").exists() {
+        anyhow::bail!("Existing index metadata disappeared during update");
+    }
+    let doc_ids = MmapIndex::update_append_with_gpu_memory_budget(
+        embeddings,
+        index_path,
+        update_config,
+        codec_gpu_memory_budget_bytes,
+    )?;
     embeddings.clear();
 
     sender
@@ -928,6 +953,7 @@ fn run_chunk_pipeline(
         index_path,
         config,
         update_config,
+        codec_gpu_memory_budget_bytes,
         pb,
     } = pipeline;
 
@@ -963,6 +989,7 @@ fn run_chunk_pipeline(
                 index_path_for_index,
                 config,
                 update_config,
+                codec_gpu_memory_budget_bytes,
                 index_chunk_size,
             )
         })
@@ -974,6 +1001,7 @@ fn run_chunk_pipeline(
         .spawn(move || run_metadata_stage(metadata_rx, index_path_for_metadata, metadata_pb))
         .context("Failed to spawn metadata stage thread")?;
 
+    let mut producer_send: Result<()> = Ok(());
     for unit_chunk in sorted_units.chunks(index_chunk_size) {
         if is_interrupted_outside_critical() {
             was_interrupted = true;
@@ -982,9 +1010,16 @@ fn run_chunk_pipeline(
 
         let prepared = prepare_deduplicated_chunk(unit_chunk);
 
-        tokenize_tx
+        if let Err(error) = tokenize_tx
             .send(prepared)
-            .context("Failed to send prepared chunk to tokenize stage")?;
+            .context("Failed to send prepared chunk to tokenize stage")
+        {
+            // The tokenize stage is gone, so feeding must stop — but do not
+            // return early: every spawned stage is joined below so the genuine
+            // downstream failure is not masked by this closed-channel cascade.
+            producer_send = Err(error);
+            break;
+        }
     }
 
     // Signal pipeline shutdown: dropping the sender closes the channel,
@@ -992,23 +1027,83 @@ fn run_chunk_pipeline(
     // all downstream stages.
     drop(tokenize_tx);
 
-    tokenize_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Tokenize stage thread panicked"))??;
-    encode_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Encode stage thread panicked"))??;
-    pool_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Pool stage thread panicked"))??;
-    index_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Index stage thread panicked"))??;
-    metadata_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Metadata stage thread panicked"))??;
+    teardown_chunk_pipeline(
+        producer_send,
+        ChunkPipelineHandles {
+            tokenize: tokenize_handle,
+            encode: encode_handle,
+            pool: pool_handle,
+            index: index_handle,
+            metadata: metadata_handle,
+        },
+    )?;
 
     Ok(was_interrupted)
+}
+
+/// Handles for the five spawned chunk-pipeline stage threads.
+struct ChunkPipelineHandles {
+    tokenize: thread::JoinHandle<Result<()>>,
+    encode: thread::JoinHandle<Result<()>>,
+    pool: thread::JoinHandle<Result<()>>,
+    index: thread::JoinHandle<Result<()>>,
+    metadata: thread::JoinHandle<Result<()>>,
+}
+
+/// Join every pipeline stage exactly once, then resolve the outcome into a
+/// single result. Runs even when the producer send loop failed, so no stage
+/// thread is ever detached mid-pipeline.
+fn teardown_chunk_pipeline(producer_send: Result<()>, handles: ChunkPipelineHandles) -> Result<()> {
+    let stages = [
+        ("Tokenize", handles.tokenize),
+        ("Encode", handles.encode),
+        ("Pool", handles.pool),
+        ("Index", handles.index),
+        ("Metadata", handles.metadata),
+    ];
+    let joined: Vec<(&'static str, thread::Result<Result<()>>)> = stages
+        .into_iter()
+        .map(|(name, handle)| (name, handle.join()))
+        .collect();
+    resolve_pipeline_results(producer_send, joined)
+}
+
+/// Select which pipeline failure to return once every stage has been joined.
+///
+/// Stage failures cascade: when a stage returns, its input channel closes, so
+/// every upstream stage (and the producer send loop) typically fails with a
+/// generic closed-channel error. The genuine root cause is therefore the most
+/// downstream failing stage — an index-stage `next_plaid::Error::Config` must
+/// never be replaced by an upstream "failed to send" cascade. Panics are bugs
+/// rather than cascades, so they keep their dedicated diagnostics and are
+/// always reported first, in stage order.
+fn resolve_pipeline_results(
+    producer_send: Result<()>,
+    stages: Vec<(&'static str, thread::Result<Result<()>>)>,
+) -> Result<()> {
+    let mut first_panic: Option<anyhow::Error> = None;
+    let mut stage_results: Vec<Result<()>> = Vec::with_capacity(stages.len());
+    for (name, joined) in stages {
+        match joined {
+            Ok(result) => stage_results.push(result),
+            Err(_) => {
+                let panic = anyhow::anyhow!("{} stage thread panicked", name);
+                if first_panic.is_none() {
+                    first_panic = Some(panic);
+                }
+            }
+        }
+    }
+    if let Some(panic) = first_panic {
+        return Err(panic);
+    }
+
+    // Most-downstream failure wins: upstream stages and the producer only
+    // observe the closed-channel cascade from the stage that actually failed.
+    for result in stage_results.into_iter().rev() {
+        result?;
+    }
+    producer_send
 }
 
 fn parse_files_parallel(
@@ -1113,6 +1208,9 @@ pub struct IndexBuilder {
     /// codes (persisted `colgrep settings --binary`). Binary indexes cannot
     /// take incremental appends, so file changes trigger a full re-embed.
     binary: bool,
+    /// Optional per-operation CUDA codec working-memory budget in bytes.
+    /// This is not persisted and does not affect query encoding.
+    codec_gpu_memory_budget_bytes: Option<usize>,
 }
 
 impl IndexBuilder {
@@ -1167,6 +1265,7 @@ impl IndexBuilder {
             binary: crate::config::Config::load()
                 .unwrap_or_default()
                 .use_binary(),
+            codec_gpu_memory_budget_bytes: None,
         })
     }
 
@@ -1185,6 +1284,19 @@ impl IndexBuilder {
 
     pub fn set_dynamic_batch(&mut self, dynamic_batch: bool) {
         self.dynamic_batch = dynamic_batch;
+    }
+
+    /// Set an explicit per-operation CUDA codec working-memory budget in bytes.
+    ///
+    /// This budget controls indexing compression batch sizes only. It is not a
+    /// process-wide VRAM cap, is not persisted in index identity, and does not
+    /// affect query encoding. A value of zero is rejected.
+    pub fn set_codec_gpu_memory_budget_bytes(&mut self, budget_bytes: usize) -> Result<()> {
+        if budget_bytes == 0 {
+            anyhow::bail!("CUDA codec memory budget must be greater than zero");
+        }
+        self.codec_gpu_memory_budget_bytes = Some(budget_bytes);
+        Ok(())
     }
 
     /// Default session count for an encoding workload of `num_units` units.
@@ -1429,12 +1541,17 @@ impl IndexBuilder {
                 index_path,
                 config,
                 update_config,
+                codec_gpu_memory_budget_bytes: self.codec_gpu_memory_budget_bytes,
                 pb,
             },
         );
 
         #[cfg(feature = "_cuda")]
         if let Err(gpu_err) = result {
+            if contains_codec_config_error(&gpu_err) {
+                return Err(gpu_err);
+            }
+
             if self.is_using_gpu() {
                 let accel = env_acceleration_mode_lossy();
                 if accel == AccelerationMode::ForceGpu {
@@ -1476,6 +1593,7 @@ impl IndexBuilder {
                         index_path,
                         config,
                         update_config,
+                        codec_gpu_memory_budget_bytes: self.codec_gpu_memory_budget_bytes,
                         pb,
                     },
                 );
@@ -4597,6 +4715,213 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "_cuda")]
+    #[test]
+    fn codec_config_errors_are_found_through_anyhow_chain() {
+        let error = anyhow::Error::new(next_plaid::Error::Config("invalid budget".into()))
+            .context("index pipeline failed");
+        assert!(contains_codec_config_error(&error));
+    }
+
+    #[cfg(feature = "_cuda")]
+    #[test]
+    #[ignore = "requires an available CUDA device"]
+    fn initial_codec_budget_fails_before_metadata_message() {
+        use ndarray::Array2;
+        use std::sync::mpsc::TryRecvError;
+
+        next_plaid::cuda::get_global_context().expect("requires an available CUDA device");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (input_tx, input_rx) = mpsc::channel();
+        let (metadata_tx, metadata_rx) = mpsc::sync_channel(1);
+        let unit = Arc::new(CodeUnit::new(
+            "unit".to_string(),
+            PathBuf::from("unit.rs"),
+            1,
+            1,
+            Language::Rust,
+            crate::parser::UnitType::Function,
+            None,
+        ));
+        input_tx
+            .send(PooledChunkForIndex {
+                units: vec![unit.clone(), unit],
+                embeddings: vec![Array2::zeros((4, 8)), Array2::zeros((4, 8))],
+            })
+            .unwrap();
+        drop(input_tx);
+
+        let config = IndexConfig {
+            force_cpu: false,
+            binary: false,
+            ..Default::default()
+        };
+        let error = run_index_stage(
+            input_rx,
+            metadata_tx,
+            temp_dir.path().to_str().unwrap().to_string(),
+            config,
+            UpdateConfig::default(),
+            Some(256),
+            2,
+        )
+        .unwrap_err();
+
+        assert!(contains_codec_config_error(&error));
+        assert!(error.to_string().contains("cannot hold one"));
+        assert!(matches!(
+            metadata_rx.try_recv(),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected)
+        ));
+    }
+
+    /// Fabricated stage outcomes use the same stage order as
+    /// `teardown_chunk_pipeline`: tokenize → encode → pool → index → metadata.
+    fn stage_results(
+        tokenize: Result<()>,
+        encode: Result<()>,
+        pool: Result<()>,
+        index: Result<()>,
+        metadata: Result<()>,
+    ) -> Vec<(&'static str, thread::Result<Result<()>>)> {
+        vec![
+            ("Tokenize", Ok(tokenize)),
+            ("Encode", Ok(encode)),
+            ("Pool", Ok(pool)),
+            ("Index", Ok(index)),
+            ("Metadata", Ok(metadata)),
+        ]
+    }
+
+    fn closed_channel_cascade(context: &str) -> Result<()> {
+        Err(anyhow::anyhow!("sending on a closed channel").context(context.to_string()))
+    }
+
+    fn index_codec_config_error() -> Result<()> {
+        Err(anyhow::Error::new(next_plaid::Error::Config(
+            "CUDA codec memory budget cannot hold one compression row".to_string(),
+        ))
+        .context("index stage failed"))
+    }
+
+    fn assert_codec_config_selected(error: &anyhow::Error) {
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<next_plaid::Error>()
+                .is_some_and(|e| matches!(e, next_plaid::Error::Config(_)))),
+            "expected next_plaid::Error::Config in the error chain, got: {error:?}"
+        );
+    }
+
+    /// Regression: when the index stage rejects the codec budget with several
+    /// chunks in flight, upstream stages and the producer only see
+    /// closed-channel cascades. The returned error must be the index stage's
+    /// Config error so `contains_codec_config_error` can gate the CPU retry.
+    #[test]
+    fn index_config_error_wins_over_upstream_channel_cascades() {
+        let producer_send =
+            closed_channel_cascade("Failed to send prepared chunk to tokenize stage");
+        let stages = stage_results(
+            closed_channel_cascade("Failed to send tokenized chunk to encode stage"),
+            closed_channel_cascade("Failed to send raw embeddings to pooling stage"),
+            closed_channel_cascade("Failed to send pooled embeddings to index stage"),
+            index_codec_config_error(),
+            Ok(()),
+        );
+        let error = resolve_pipeline_results(producer_send, stages).unwrap_err();
+        assert_codec_config_selected(&error);
+    }
+
+    /// The most downstream failing stage is the root cause: when the metadata
+    /// stage fails, the index stage's send failure is only the cascade.
+    #[test]
+    fn most_downstream_stage_error_wins_over_cascades() {
+        let producer_send =
+            closed_channel_cascade("Failed to send prepared chunk to tokenize stage");
+        let stages = stage_results(
+            closed_channel_cascade("tokenize cascade"),
+            closed_channel_cascade("encode cascade"),
+            closed_channel_cascade("pool cascade"),
+            closed_channel_cascade("Failed to send indexed chunk to metadata stage"),
+            Err(anyhow::anyhow!("filtering database is read-only")),
+        );
+        let error = resolve_pipeline_results(producer_send, stages).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("filtering database is read-only"),
+            "expected the metadata stage error, got: {error:?}"
+        );
+    }
+
+    /// Panics are bugs, not cascades: they keep their per-stage diagnostics
+    /// and are reported before any stage error.
+    #[test]
+    fn stage_panic_diagnostics_are_preserved() {
+        let mut stages = stage_results(Ok(()), Ok(()), Ok(()), index_codec_config_error(), Ok(()));
+        stages[0] = ("Tokenize", Err(Box::new("boom")));
+        let error = resolve_pipeline_results(Ok(()), stages).unwrap_err();
+        assert_eq!(error.to_string(), "Tokenize stage thread panicked");
+
+        let mut stages = stage_results(Ok(()), Ok(()), Ok(()), Ok(()), Ok(()));
+        stages[3] = ("Index", Err(Box::new("boom")));
+        let error = resolve_pipeline_results(Ok(()), stages).unwrap_err();
+        assert_eq!(error.to_string(), "Index stage thread panicked");
+    }
+
+    #[test]
+    fn producer_send_error_is_returned_when_stages_succeed() {
+        let stages = stage_results(Ok(()), Ok(()), Ok(()), Ok(()), Ok(()));
+        let producer_send =
+            closed_channel_cascade("Failed to send prepared chunk to tokenize stage");
+        let error = resolve_pipeline_results(producer_send, stages).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to send prepared chunk to tokenize stage"),
+            "expected the producer send error, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn successful_pipeline_results_resolve_to_ok() {
+        let stages = stage_results(Ok(()), Ok(()), Ok(()), Ok(()), Ok(()));
+        resolve_pipeline_results(Ok(()), stages).unwrap();
+    }
+
+    /// Teardown must join every spawned stage exactly once and consume every
+    /// result even when the producer send failed — no detached threads — and
+    /// the index stage's Config error still wins over the live cascades.
+    #[test]
+    fn teardown_joins_every_stage_and_consumes_all_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let spawn_stage = |result: Result<()>| {
+            let completed = Arc::clone(&completed);
+            thread::spawn(move || {
+                completed.fetch_add(1, Ordering::SeqCst);
+                result
+            })
+        };
+
+        let handles = ChunkPipelineHandles {
+            tokenize: spawn_stage(closed_channel_cascade("tokenize cascade")),
+            encode: spawn_stage(closed_channel_cascade("encode cascade")),
+            pool: spawn_stage(closed_channel_cascade("pool cascade")),
+            index: spawn_stage(index_codec_config_error()),
+            metadata: spawn_stage(Ok(())),
+        };
+        let producer_send =
+            closed_channel_cascade("Failed to send prepared chunk to tokenize stage");
+
+        let error = teardown_chunk_pipeline(producer_send, handles).unwrap_err();
+
+        assert_eq!(completed.load(Ordering::SeqCst), 5);
+        assert_codec_config_selected(&error);
+    }
+
     /// The mtime fast path in `compute_update_plan` must skip content hashing
     /// for files whose stored mtime is unchanged. The stored hash is wrong on
     /// purpose: if the plan still reports the file as unchanged, hashing was
@@ -5440,7 +5765,30 @@ mod tests {
             auto_confirm: true,
             model_id: "test-model".to_string(),
             binary: false,
+            codec_gpu_memory_budget_bytes: None,
         }
+    }
+
+    #[test]
+    fn test_codec_gpu_memory_budget_setter_is_per_builder_and_rejects_zero() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut builder = test_builder(project_dir.path(), index_dir.path());
+
+        assert_eq!(builder.codec_gpu_memory_budget_bytes, None);
+        builder
+            .set_codec_gpu_memory_budget_bytes(256 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            builder.codec_gpu_memory_budget_bytes,
+            Some(256 * 1024 * 1024)
+        );
+        let error = builder.set_codec_gpu_memory_budget_bytes(0).unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+        assert_eq!(
+            builder.codec_gpu_memory_budget_bytes,
+            Some(256 * 1024 * 1024)
+        );
     }
 
     /// Build a small vector index + filtering DB at `index_path`, distributing `n` documents

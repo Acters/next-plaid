@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::binary;
 use crate::codec::ResidualCodec;
 use crate::error::{Error, Result};
+#[cfg(feature = "_cuda")]
+use crate::kmeans::estimate_num_partitions;
 use crate::kmeans::{compute_kmeans, ComputeKmeansConfig};
 use crate::utils::{atomic_write_file, quantile, quantiles};
 
@@ -38,6 +40,60 @@ fn compress_and_residuals_cpu(
         });
 
     (codes, residuals)
+}
+
+fn compress_and_residuals_with_gpu_memory_budget(
+    embeddings: &Array2<f32>,
+    codec: &ResidualCodec,
+    force_cpu: bool,
+    gpu_memory_budget_bytes: Option<usize>,
+) -> Result<(Array1<usize>, Array2<f32>)> {
+    #[cfg(feature = "_cuda")]
+    if !force_cpu && !crate::is_force_cpu() {
+        let force_gpu = crate::is_force_gpu();
+        if let Some(ctx) = crate::cuda::get_global_context() {
+            let centroids = codec.centroids_view();
+            if let Some(budget) = gpu_memory_budget_bytes {
+                crate::cuda::validate_compression_budget(
+                    &embeddings.view(),
+                    &centroids,
+                    budget,
+                    true,
+                )?;
+            }
+
+            match crate::cuda::compress_and_residuals_cuda_batched(
+                &ctx,
+                &embeddings.view(),
+                &centroids,
+                gpu_memory_budget_bytes,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(e) if gpu_memory_budget_bytes.is_some() && matches!(e, Error::Config(_)) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    if force_gpu {
+                        panic!(
+                            "FORCE_GPU is set but CUDA compress_and_residuals failed: {}",
+                            e
+                        );
+                    }
+                    eprintln!(
+                        "[next-plaid] CUDA compress_and_residuals failed: {}, falling back to CPU",
+                        e
+                    );
+                }
+            }
+        } else if force_gpu {
+            panic!("FORCE_GPU is set but CUDA context is unavailable");
+        }
+    }
+
+    #[cfg(not(feature = "_cuda"))]
+    let _ = (force_cpu, gpu_memory_budget_bytes);
+
+    Ok(compress_and_residuals_cpu(embeddings, codec))
 }
 
 /// Configuration for index creation
@@ -195,6 +251,19 @@ pub fn prepare_codec_artifacts(
     centroids: Array2<f32>,
     config: &IndexConfig,
 ) -> Result<PreparedCodecArtifacts> {
+    prepare_codec_artifacts_with_gpu_memory_budget(embeddings, centroids, config, None)
+}
+
+/// Prepare codec training artifacts with an optional per-operation CUDA memory budget.
+///
+/// The budget is transient: it controls only CUDA compression during this preparation call
+/// and is not part of [`IndexConfig`] or persisted index metadata.
+pub fn prepare_codec_artifacts_with_gpu_memory_budget(
+    embeddings: &[Array2<f32>],
+    centroids: Array2<f32>,
+    config: &IndexConfig,
+    gpu_memory_budget_bytes: Option<usize>,
+) -> Result<PreparedCodecArtifacts> {
     let embedding_dim = centroids.ncols();
     let total_embeddings: usize = embeddings.iter().map(|e| e.nrows()).sum();
     let num_documents = embeddings.len();
@@ -246,7 +315,8 @@ pub fn prepare_codec_artifacts(
     let heldout_codes = if config.force_cpu {
         initial_codec.compress_into_codes_cpu(&heldout)
     } else {
-        initial_codec.compress_into_codes(&heldout)
+        initial_codec
+            .compress_into_codes_with_gpu_memory_budget(&heldout, gpu_memory_budget_bytes)?
     };
 
     let mut residuals = heldout.clone();
@@ -303,6 +373,21 @@ pub fn encode_index_chunk(
     force_cpu: bool,
     binary: bool,
 ) -> Result<EncodedIndexChunk> {
+    encode_index_chunk_with_gpu_memory_budget(embeddings, codec, force_cpu, binary, None)
+}
+
+/// Encode one index chunk, optionally bounding CUDA codec working memory.
+///
+/// The budget is applied to both centroid-code compression (including binary document storage)
+/// and fused residual compression. `None` preserves the existing 4 GiB CUDA default. CPU
+/// behavior is unchanged.
+pub fn encode_index_chunk_with_gpu_memory_budget(
+    embeddings: &[Array2<f32>],
+    codec: &ResidualCodec,
+    force_cpu: bool,
+    binary: bool,
+    gpu_memory_budget_bytes: Option<usize>,
+) -> Result<EncodedIndexChunk> {
     let embedding_dim = codec.embedding_dim();
     let packed_dim = if binary {
         binary::packed_dim(embedding_dim)
@@ -329,49 +414,19 @@ pub fn encode_index_chunk(
         let codes = if force_cpu {
             codec.compress_into_codes_cpu(&batch_embeddings)
         } else {
-            codec.compress_into_codes(&batch_embeddings)
+            codec.compress_into_codes_with_gpu_memory_budget(
+                &batch_embeddings,
+                gpu_memory_budget_bytes,
+            )?
         };
         (codes, Array2::<f32>::zeros((0, embedding_dim)))
     } else {
-        #[cfg(feature = "_cuda")]
-        {
-            let force_gpu = crate::is_force_gpu();
-            if !force_cpu {
-                if let Some(ctx) = crate::cuda::get_global_context() {
-                    match crate::cuda::compress_and_residuals_cuda_batched(
-                        &ctx,
-                        &batch_embeddings.view(),
-                        &codec.centroids_view(),
-                        None,
-                    ) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            if force_gpu {
-                                panic!(
-                                    "FORCE_GPU is set but CUDA compress_and_residuals failed: {}",
-                                    e
-                                );
-                            }
-                            println!(
-                                "[next-plaid] CUDA compress_and_residuals failed: {}, falling back to CPU",
-                                e
-                            );
-                            compress_and_residuals_cpu(&batch_embeddings, codec)
-                        }
-                    }
-                } else if force_gpu {
-                    panic!("FORCE_GPU is set but CUDA context is unavailable");
-                } else {
-                    compress_and_residuals_cpu(&batch_embeddings, codec)
-                }
-            } else {
-                compress_and_residuals_cpu(&batch_embeddings, codec)
-            }
-        }
-        #[cfg(not(feature = "_cuda"))]
-        {
-            compress_and_residuals_cpu(&batch_embeddings, codec)
-        }
+        compress_and_residuals_with_gpu_memory_budget(
+            &batch_embeddings,
+            codec,
+            force_cpu,
+            gpu_memory_budget_bytes,
+        )?
     };
 
     let batch_packed = if binary {
@@ -395,6 +450,47 @@ pub fn encode_index_chunk(
         residuals,
         doclens,
     })
+}
+
+/// Validate a transient CUDA codec budget for the first chunk of a new index.
+///
+/// This intentionally does nothing when CPU execution is selected or CUDA cannot be initialized.
+/// For a ColGREP initial create, the first chunk is the complete K-means sample, so the same
+/// partition heuristic and sample-token cap determine the codec shape used by the write.
+pub fn preflight_codec_gpu_memory_budget(
+    embeddings: &[Array2<f32>],
+    force_cpu: bool,
+    binary: bool,
+    gpu_memory_budget_bytes: Option<usize>,
+) -> Result<()> {
+    let Some(budget) = gpu_memory_budget_bytes else {
+        return Ok(());
+    };
+    if force_cpu || crate::is_force_cpu() {
+        return Ok(());
+    }
+
+    #[cfg(feature = "_cuda")]
+    {
+        if crate::cuda::get_global_context().is_none() {
+            return Ok(());
+        }
+
+        let sample_tokens: usize = embeddings.iter().map(Array2::nrows).sum();
+        let num_centroids = estimate_num_partitions(embeddings).min(sample_tokens);
+        let embedding_dim = embeddings.first().map_or(0, Array2::ncols);
+        crate::cuda::validate_compression_budget_shape(
+            num_centroids,
+            embedding_dim,
+            budget,
+            !binary,
+        )?;
+    }
+
+    #[cfg(not(feature = "_cuda"))]
+    let _ = (embeddings, binary, budget);
+
+    Ok(())
 }
 
 pub fn write_index_from_encoded_chunks(
@@ -1753,8 +1849,21 @@ impl MmapIndex {
         index_path: &str,
         update_config: &crate::update::UpdateConfig,
     ) -> Result<Vec<i64>> {
+        Self::update_append_with_gpu_memory_budget(embeddings, index_path, update_config, None)
+    }
+
+    /// Append embeddings to an existing index with an optional transient CUDA codec budget.
+    ///
+    /// Unlike the generic update-or-create APIs, this method requires the index metadata to
+    /// exist and never creates or rebuilds an index.
+    pub fn update_append_with_gpu_memory_budget(
+        embeddings: &[Array2<f32>],
+        index_path: &str,
+        update_config: &crate::update::UpdateConfig,
+        gpu_memory_budget_bytes: Option<usize>,
+    ) -> Result<Vec<i64>> {
         use crate::codec::ResidualCodec;
-        use crate::update::update_index;
+        use crate::update::update_index_with_gpu_memory_budget;
 
         let index_dir = std::path::Path::new(index_path);
         let metadata = Metadata::load_from_path(index_dir)?;
@@ -1762,13 +1871,14 @@ impl MmapIndex {
         let start_doc_id = metadata.num_documents as i64;
         let num_new_docs = embeddings.len();
 
-        update_index(
+        update_index_with_gpu_memory_budget(
             embeddings,
             index_path,
             &codec,
             Some(update_config.batch_size),
             false,
             update_config.force_cpu,
+            gpu_memory_budget_bytes,
         )?;
 
         Ok((start_doc_id..start_doc_id + num_new_docs as i64).collect())

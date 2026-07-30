@@ -386,6 +386,15 @@ The CUDA module uses cuBLAS for matrix multiplication and custom PTX kernels for
 
 > **Tip:** First CUDA context creation can take 10-30s. Enable GPU persistence mode to reduce this: `sudo nvidia-smi -pm 1`
 
+### CUDA codec memory budget
+
+ColGREP can pass a transient per-run CUDA codec working-memory budget through
+`prepare_codec_artifacts_with_gpu_memory_budget`, `encode_index_chunk_with_gpu_memory_budget`,
+and `MmapIndex::update_append_with_gpu_memory_budget`. These APIs bound compression batch
+sizes; the budget is not a process-wide VRAM cap, is not persisted in index metadata, and is
+ignored when CPU execution is selected. The ordinary APIs retain the existing 4 GiB CUDA
+default.
+
 ---
 
 ## Index File Structure

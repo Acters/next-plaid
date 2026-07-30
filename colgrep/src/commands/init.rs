@@ -14,6 +14,7 @@ pub struct InitOptions<'a> {
     pub encode_batch_size: Option<usize>,
     pub index_chunk_size: Option<usize>,
     pub codec_gpu_memory_mb: Option<u64>,
+    pub pooling_threads: Option<usize>,
     pub static_batch: bool,
 }
 
@@ -97,6 +98,9 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     builder.set_dynamic_batch(!options.static_batch);
     if let Some(codec_gpu_memory_budget_bytes) = codec_gpu_memory_budget_bytes {
         builder.set_codec_gpu_memory_budget_bytes(codec_gpu_memory_budget_bytes)?;
+    }
+    if let Some(pooling_threads) = options.pooling_threads {
+        builder.set_pooling_threads(pooling_threads)?;
     }
     if let Some(encode_batch_size) = options.encode_batch_size {
         builder.set_encode_batch_size(encode_batch_size.max(1));

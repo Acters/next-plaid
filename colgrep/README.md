@@ -70,6 +70,7 @@ colgrep init              # current directory
 colgrep init /path/to/project  # or a specific project
 colgrep init -y  # auto-confirm for large codebases (>10K code units)
 colgrep init --codec-gpu-memory-mb 256  # per-run CUDA codec working-memory budget
+colgrep init --pooling-threads 4  # per-run bound on dedicated document-pooling workers
 ```
 
 **Search:**
@@ -163,6 +164,7 @@ colgrep settings --no-hybrid-search
 |      | `--no-pool`         | Disable embedding pooling                |
 |      | `--pool-factor`     | Set pool factor (default: 2)             |
 |      | `--codec-gpu-memory-mb` | `init` only: per-run CUDA codec working-memory budget (MiB) |
+|      | `--pooling-threads` | `init` only: per-run bound on dedicated document-pooling workers |
 
 ### Filtering
 
@@ -321,6 +323,31 @@ compression; it is **not** a process-wide VRAM cap, is not persisted in index id
 does not affect query encoding. Omit it to preserve the existing 4 GiB CUDA default.
 The 256 MiB value was validated experimentally, but is not made the default. The value must
 be a positive integer and is converted to bytes with checked arithmetic.
+
+#### Dedicated pooling workers
+
+Use `colgrep init --pooling-threads <N>` to bound the dedicated Rayon workers that run
+hierarchical document-embedding pooling for that indexing run. The bound applies **only** to
+pooling: ONNX sessions, the tokenizer, the index codec, and the global Rayon pool are
+unaffected. The setting is per-run, is not persisted in index identity, and does not affect
+query encoding. Omit it to preserve the existing global-Rayon pooling behavior exactly.
+The value must be a positive integer no greater than the host's available parallelism.
+With pooling disabled (`--no-pool` / pool factor 1) no dedicated pool is built and the
+option is a harmless no-op.
+
+Measured in isolation on a full-corpus source-only index build with the validated
+256 MiB CUDA codec budget (default pooling vs. bounded pooling workers):
+
+| Run | Wall time | Host HWM |
+| --- | --- | --- |
+| default pooling | 60.89 s | 1,765.8 MiB |
+| `--pooling-threads 4` | 62.19 s | 1,643.9 MiB |
+| `--pooling-threads 2` | 67.87 s | 1,598.1 MiB |
+
+Both bounded runs retained the identical ordered top-10 results on 20/20 benchmark
+queries. `--pooling-threads 4` is the best balance between the small time cost and the
+memory saving, but the evidence comes from one machine and workload so far, so the
+control remains opt-in and is not the default.
 
 ### Binary Embedding Storage
 

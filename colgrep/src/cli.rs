@@ -159,6 +159,16 @@ fn parse_positive_codec_gpu_memory_mb(raw: &str) -> Result<u64, String> {
     Ok(mib)
 }
 
+fn parse_positive_pooling_threads(raw: &str) -> Result<usize, String> {
+    let threads = raw
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer number of threads".to_string())?;
+    if threads == 0 {
+        return Err("must be greater than zero threads".to_string());
+    }
+    Ok(threads)
+}
+
 pub const INIT_HELP: &str = "\
 EXAMPLES:
     # Build or update index for the current directory
@@ -182,6 +192,9 @@ EXAMPLES:
     # Bound CUDA codec working memory for this indexing run (not a VRAM cap)
     colgrep init --codec-gpu-memory-mb 256
 
+    # Bound dedicated document-pooling workers for this run (not ONNX/tokenizer/codec threads)
+    colgrep init --pooling-threads 4
+
     # Override outer index chunk size for benchmarking/tuning
     colgrep init --index-chunk-size 4096
 
@@ -195,6 +208,9 @@ NOTES:
     • --codec-gpu-memory-mb is a per-run CUDA codec working-memory budget, not a process-wide VRAM cap
     • Omit --codec-gpu-memory-mb to preserve the 4 GiB CUDA codec default
     • 256 MiB was validated experimentally, but is not the default
+    • --pooling-threads bounds only hierarchical document-embedding pooling workers for this run;
+      ONNX sessions, the tokenizer, the index codec, and the global Rayon pool are unaffected
+    • Omit --pooling-threads to preserve the default global-Rayon pooling behavior exactly
     • Useful for pre-warming the index before searching
     • Subsequent searches will be fast since the index is already built";
 
@@ -666,6 +682,14 @@ pub enum Commands {
         )]
         codec_gpu_memory_mb: Option<u64>,
 
+        /// Bound dedicated document-pooling workers for this indexing run (not ONNX/tokenizer/codec threads)
+        #[arg(
+            long = "pooling-threads",
+            value_name = "N",
+            value_parser = parse_positive_pooling_threads
+        )]
+        pooling_threads: Option<usize>,
+
         /// Use strict batch-size batching instead of fixed dynamic GPU batching
         #[arg(long = "static-batch")]
         static_batch: bool,
@@ -834,6 +858,46 @@ mod tests {
     #[test]
     fn codec_gpu_memory_cli_rejects_non_integer() {
         let error = Cli::try_parse_from(["colgrep", "init", "--codec-gpu-memory-mb", "1.5"])
+            .err()
+            .expect("non-integer should be rejected");
+        assert!(error.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn pooling_threads_cli_defaults_to_none() {
+        let cli = Cli::try_parse_from(["colgrep", "init"]).unwrap();
+        let Some(Commands::Init {
+            pooling_threads, ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(pooling_threads, None);
+    }
+
+    #[test]
+    fn pooling_threads_cli_parses_positive() {
+        let cli = Cli::try_parse_from(["colgrep", "init", "--pooling-threads", "4"]).unwrap();
+        let Some(Commands::Init {
+            pooling_threads, ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(pooling_threads, Some(4));
+    }
+
+    #[test]
+    fn pooling_threads_cli_rejects_zero() {
+        let error = Cli::try_parse_from(["colgrep", "init", "--pooling-threads", "0"])
+            .err()
+            .expect("zero should be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn pooling_threads_cli_rejects_non_integer() {
+        let error = Cli::try_parse_from(["colgrep", "init", "--pooling-threads", "2.5"])
             .err()
             .expect("non-integer should be rejected");
         assert!(error.to_string().contains("positive integer"));

@@ -456,6 +456,9 @@ struct ChunkPipelineConfig<'a> {
     update_config: UpdateConfig,
     /// Transient CUDA codec budget; deliberately kept outside next-plaid's public configs.
     codec_gpu_memory_budget_bytes: Option<usize>,
+    /// Dedicated Rayon workers for the pooling stage only; `None` keeps the
+    /// existing global-Rayon behavior exactly.
+    pooling_threads: Option<usize>,
     pb: Option<&'a ProgressBar>,
 }
 
@@ -600,16 +603,82 @@ fn run_tokenize_stage(
     Ok(())
 }
 
+/// Host upper bound for dedicated pooling workers: the available parallelism.
+/// Values above this would oversubscribe the machine.
+fn max_pooling_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+}
+
+/// Validate a dedicated pooling worker count. Zero and values above the
+/// host's available parallelism are rejected with a clear error.
+fn validate_pooling_threads(threads: usize) -> Result<usize> {
+    let max = max_pooling_threads();
+    if threads == 0 {
+        anyhow::bail!("pooling threads must be greater than zero");
+    }
+    if threads > max {
+        anyhow::bail!("pooling threads ({threads}) exceeds available parallelism ({max})");
+    }
+    Ok(threads)
+}
+
+/// Dedicated pooling only helps when pooling actually runs in parallel:
+/// pool factor `None`/`1` (`--no-pool`) is a passthrough, so it selects no
+/// dedicated pool and an explicit `pooling_threads` is a harmless no-op there.
+fn dedicated_pooling_threads(
+    pool_factor: Option<usize>,
+    pooling_threads: Option<usize>,
+) -> Option<usize> {
+    match (pool_factor, pooling_threads) {
+        (Some(factor), Some(threads)) if factor > 1 => Some(threads),
+        _ => None,
+    }
+}
+
+/// Build the dedicated Rayon pool for one pooling-stage run.
+///
+/// Only hierarchical document-embedding pooling (`pool_document_embeddings`)
+/// runs on these workers: ONNX sessions, the tokenizer, the index codec, and
+/// the global Rayon pool keep their existing threading. Construction errors
+/// propagate so the pipeline reports a genuine stage failure.
+fn build_pooling_thread_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    // Defensive re-validation: callers normally go through the setter, but an
+    // invalid count must never reach the Rayon builder.
+    let threads = validate_pooling_threads(threads)?;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("colgrep-pooling-{idx}"))
+        .build()
+        .context("Failed to build dedicated pooling thread pool")
+}
+
 /// Pool raw token-level embeddings into document-level vectors, then expand
 /// deduplicated embeddings back to the full set. After this stage every
 /// original code unit has its own embedding copy ready for index insertion.
+///
+/// When `pooling_threads` is set and pooling actually runs (pool factor > 1),
+/// one dedicated pool is built before the receive loop and each chunk's
+/// pooling is scoped to it via `pool.install`; otherwise pooling runs on the
+/// global Rayon pool exactly as before and no pooling workers are spawned.
 fn run_pool_stage(
     receiver: mpsc::Receiver<RawEncodedChunk>,
     sender: mpsc::SyncSender<PooledChunkForIndex>,
     pool_factor: Option<usize>,
+    pooling_threads: Option<usize>,
 ) -> Result<()> {
+    let pooling_pool = match dedicated_pooling_threads(pool_factor, pooling_threads) {
+        Some(threads) => Some(build_pooling_thread_pool(threads)?),
+        None => None,
+    };
     while let Ok(chunk) = receiver.recv() {
-        let pooled_unique = pool_document_embeddings(chunk.raw_embeddings, pool_factor);
+        let pooled_unique = match pooling_pool.as_ref() {
+            Some(pool) => {
+                pool.install(|| pool_document_embeddings(chunk.raw_embeddings, pool_factor))
+            }
+            None => pool_document_embeddings(chunk.raw_embeddings, pool_factor),
+        };
         // Expand: map each original unit back to its deduplicated embedding.
         let embeddings = chunk
             .original_to_unique
@@ -954,6 +1023,7 @@ fn run_chunk_pipeline(
         config,
         update_config,
         codec_gpu_memory_budget_bytes,
+        pooling_threads,
         pb,
     } = pipeline;
 
@@ -977,7 +1047,7 @@ fn run_chunk_pipeline(
         .context("Failed to spawn encode stage thread")?;
     let pool_handle = thread::Builder::new()
         .name("colgrep-pool".to_string())
-        .spawn(move || run_pool_stage(pool_rx, index_tx, pool_factor))
+        .spawn(move || run_pool_stage(pool_rx, index_tx, pool_factor, pooling_threads))
         .context("Failed to spawn pool stage thread")?;
     let index_path_for_index = index_path.to_string();
     let index_handle = thread::Builder::new()
@@ -1211,6 +1281,11 @@ pub struct IndexBuilder {
     /// Optional per-operation CUDA codec working-memory budget in bytes.
     /// This is not persisted and does not affect query encoding.
     codec_gpu_memory_budget_bytes: Option<usize>,
+    /// Optional dedicated Rayon worker count for the hierarchical
+    /// document-embedding pooling stage. This is not persisted, does not
+    /// affect index identity, and leaves ONNX sessions, the tokenizer, the
+    /// index codec, and the global Rayon pool untouched.
+    pooling_threads: Option<usize>,
 }
 
 impl IndexBuilder {
@@ -1266,6 +1341,7 @@ impl IndexBuilder {
                 .unwrap_or_default()
                 .use_binary(),
             codec_gpu_memory_budget_bytes: None,
+            pooling_threads: None,
         })
     }
 
@@ -1296,6 +1372,19 @@ impl IndexBuilder {
             anyhow::bail!("CUDA codec memory budget must be greater than zero");
         }
         self.codec_gpu_memory_budget_bytes = Some(budget_bytes);
+        Ok(())
+    }
+
+    /// Set a dedicated Rayon worker count for the hierarchical
+    /// document-embedding pooling stage during indexing.
+    ///
+    /// Only pooling workers are bounded: ONNX sessions, the tokenizer, the
+    /// index codec, and the global Rayon pool are unaffected. This is not
+    /// persisted in index identity and does not affect query encoding. Zero
+    /// and values above the host's available parallelism are rejected; leave
+    /// unset to preserve the default global-Rayon behavior exactly.
+    pub fn set_pooling_threads(&mut self, threads: usize) -> Result<()> {
+        self.pooling_threads = Some(validate_pooling_threads(threads)?);
         Ok(())
     }
 
@@ -1542,6 +1631,7 @@ impl IndexBuilder {
                 config,
                 update_config,
                 codec_gpu_memory_budget_bytes: self.codec_gpu_memory_budget_bytes,
+                pooling_threads: self.pooling_threads,
                 pb,
             },
         );
@@ -1594,6 +1684,7 @@ impl IndexBuilder {
                         config,
                         update_config,
                         codec_gpu_memory_budget_bytes: self.codec_gpu_memory_budget_bytes,
+                        pooling_threads: self.pooling_threads,
                         pb,
                     },
                 );
@@ -5766,6 +5857,7 @@ mod tests {
             model_id: "test-model".to_string(),
             binary: false,
             codec_gpu_memory_budget_bytes: None,
+            pooling_threads: None,
         }
     }
 
@@ -5789,6 +5881,161 @@ mod tests {
             builder.codec_gpu_memory_budget_bytes,
             Some(256 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn test_pooling_threads_setter_is_per_builder_and_enforces_bounds() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut builder = test_builder(project_dir.path(), index_dir.path());
+        let max = max_pooling_threads();
+
+        assert_eq!(builder.pooling_threads, None);
+        let in_range = 4.min(max);
+        builder.set_pooling_threads(in_range).unwrap();
+        assert_eq!(builder.pooling_threads, Some(in_range));
+
+        let error = builder.set_pooling_threads(0).unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+        assert_eq!(builder.pooling_threads, Some(in_range));
+
+        let error = builder.set_pooling_threads(max + 1).unwrap_err();
+        assert!(error.to_string().contains("exceeds available parallelism"));
+        assert_eq!(builder.pooling_threads, Some(in_range));
+    }
+
+    /// Bounds are deterministic relative to the host: zero and
+    /// `available_parallelism + 1` are rejected while positive in-range
+    /// values are preserved, including through the defensive builder path.
+    #[test]
+    fn validate_pooling_threads_bounds() {
+        let max = max_pooling_threads();
+
+        let error = validate_pooling_threads(0).unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+
+        let error = validate_pooling_threads(max + 1).unwrap_err();
+        assert!(error.to_string().contains("exceeds available parallelism"));
+        let error = build_pooling_thread_pool(max + 1).unwrap_err();
+        assert!(error.to_string().contains("exceeds available parallelism"));
+
+        assert_eq!(validate_pooling_threads(1).unwrap(), 1);
+        assert_eq!(validate_pooling_threads(max).unwrap(), max);
+    }
+
+    /// Pool factors None/1 are a passthrough: they select no dedicated pool,
+    /// so no pooling workers are spawned even when a bound was requested.
+    #[test]
+    fn dedicated_pool_selected_only_for_parallel_pool_factors() {
+        assert_eq!(dedicated_pooling_threads(None, Some(4)), None);
+        assert_eq!(dedicated_pooling_threads(Some(1), Some(4)), None);
+        assert_eq!(dedicated_pooling_threads(None, None), None);
+        assert_eq!(dedicated_pooling_threads(Some(2), None), None);
+        assert_eq!(dedicated_pooling_threads(Some(2), Some(4)), Some(4));
+    }
+
+    /// Deterministic raw chunk for pool-stage tests: fixed embeddings with a
+    /// 1:1 original-to-unique mapping (no dedup).
+    fn pool_stage_chunk(seed: usize, docs: usize, tokens: usize, dim: usize) -> RawEncodedChunk {
+        let units: Vec<Arc<CodeUnit>> = (0..docs)
+            .map(|i| {
+                Arc::new(CodeUnit::new(
+                    format!("unit-{seed}-{i}"),
+                    PathBuf::from(format!("file-{seed}.rs")),
+                    i + 1,
+                    i + 1,
+                    Language::Rust,
+                    crate::parser::UnitType::Function,
+                    None,
+                ))
+            })
+            .collect();
+        let raw_embeddings = (0..docs)
+            .map(|i| {
+                ndarray::Array2::from_shape_fn((tokens, dim), |(r, c)| {
+                    ((seed * 977 + i * 131 + r * 17 + c) % 89) as f32 / 89.0
+                })
+            })
+            .collect();
+        RawEncodedChunk {
+            units,
+            raw_embeddings,
+            original_to_unique: (0..docs).collect(),
+        }
+    }
+
+    /// Run the real pool stage over `chunks` and collect every output in order.
+    fn collect_pool_stage_outputs(
+        chunks: Vec<RawEncodedChunk>,
+        pool_factor: Option<usize>,
+        pooling_threads: Option<usize>,
+    ) -> Vec<PooledChunkForIndex> {
+        let capacity = chunks.len().max(1);
+        let (input_tx, input_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::sync_channel(capacity);
+        for chunk in chunks {
+            input_tx.send(chunk).unwrap();
+        }
+        drop(input_tx);
+        run_pool_stage(input_rx, output_tx, pool_factor, pooling_threads).unwrap();
+        output_rx.into_iter().collect()
+    }
+
+    /// Bitwise embedding and ordering equality between two pool-stage runs.
+    fn assert_pool_outputs_identical(
+        expected: &[PooledChunkForIndex],
+        actual: &[PooledChunkForIndex],
+    ) {
+        assert_eq!(expected.len(), actual.len(), "chunk count differs");
+        for (expected_chunk, actual_chunk) in expected.iter().zip(actual.iter()) {
+            let expected_names: Vec<&str> = expected_chunk
+                .units
+                .iter()
+                .map(|unit| unit.name.as_str())
+                .collect();
+            let actual_names: Vec<&str> = actual_chunk
+                .units
+                .iter()
+                .map(|unit| unit.name.as_str())
+                .collect();
+            assert_eq!(expected_names, actual_names, "unit ordering differs");
+            assert_eq!(
+                expected_chunk.embeddings.len(),
+                actual_chunk.embeddings.len(),
+                "embedding count differs"
+            );
+            for (expected_emb, actual_emb) in expected_chunk
+                .embeddings
+                .iter()
+                .zip(actual_chunk.embeddings.iter())
+            {
+                assert_eq!(expected_emb.dim(), actual_emb.dim());
+                for (a, b) in expected_emb.iter().zip(actual_emb.iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "embedding values differ");
+                }
+            }
+        }
+    }
+
+    /// For pool factors None, 1, and 2, the dedicated-pool stage must produce
+    /// bitwise-identical embeddings in the same order as the default
+    /// global-Rayon stage.
+    #[test]
+    fn pool_stage_dedicated_pool_output_matches_default_for_all_pool_factors() {
+        let threads = 2.min(max_pooling_threads());
+        for pool_factor in [None, Some(1), Some(2)] {
+            let chunks = || {
+                vec![
+                    pool_stage_chunk(1, 6, 12, 8),
+                    pool_stage_chunk(2, 5, 9, 8),
+                    pool_stage_chunk(3, 7, 16, 8),
+                ]
+            };
+            let default_outputs = collect_pool_stage_outputs(chunks(), pool_factor, None);
+            let dedicated_outputs =
+                collect_pool_stage_outputs(chunks(), pool_factor, Some(threads));
+            assert_pool_outputs_identical(&default_outputs, &dedicated_outputs);
+        }
     }
 
     /// Build a small vector index + filtering DB at `index_path`, distributing `n` documents

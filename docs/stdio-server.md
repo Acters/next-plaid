@@ -46,7 +46,7 @@ Example response:
 ### Search
 
 ```json
-{"version":1,"id":"q-1","op":"search","query":"database retry logic","top_k":10,"semantic_only":false,"code_only":true,"include":["*.{rs,ts}"],"exclude":["*test*"]}
+{"version":1,"id":"q-1","op":"search","query":"database retry logic","top_k":10,"semantic_only":false,"code_only":true,"include":["*.{rs,ts}"],"exclude":["*test*"],"restrict_to_dir":"src"}
 ```
 
 Search fields:
@@ -59,8 +59,11 @@ Search fields:
 | `code_only` | boolean | no | Exclude document/config formats. |
 | `include` | string array | no | Include file globs. `include_patterns` is an alias. |
 | `exclude` | string array | no | Exclude file globs. `exclude_patterns` is an alias. |
+| `restrict_to_dir` | string | no | Relative, normalized descendant directory under the server root. Filters the already-loaded parent index without resolving or accessing the requested path. |
 
-A successful response has the same ordered `SearchResult` values as `colgrep search --json --no-update` for the corresponding options:
+`restrict_to_dir` rejects empty or current-directory-only values, absolute paths, root/prefix components, and any `..` parent traversal. Harmless `.` components and repeated separators are normalized before filtering; the request never canonicalizes or accesses this path on the filesystem.
+
+A successful response has the same ordered `SearchResult` values as `colgrep search --json --no-update` for the corresponding options. For example, a server rooted at `/path/to/project` with `restrict_to_dir: "src"` uses the same loaded-index subdirectory filter as a one-shot search run from `/path/to/project/src`.
 
 ```json
 {"version":1,"id":"q-1","ok":true,"op":"search","results":[{"unit":{"file":"/path/to/project/src/retry.rs"},"score":1.23}]}
@@ -92,7 +95,7 @@ Important codes include:
 
 - `invalid_json`, `unsupported_version`, `missing_id`, `invalid_id`
 - `missing_operation`, `unsupported_operation`, `missing_query`, `empty_query`
-- `top_k_too_large`, `invalid_glob`, `glob_too_large`
+- `top_k_too_large`, `invalid_glob`, `glob_too_large`, `invalid_restriction`
 - `index_busy`, `stale_index`, `search_failed`
 - `response_too_large`, `serialization_error`
 

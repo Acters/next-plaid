@@ -543,6 +543,7 @@ impl SearchEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn search(
         &self,
         query: &str,
@@ -551,6 +552,7 @@ impl SearchEngine {
         code_only: bool,
         include_patterns: &[String],
         exclude_patterns: &[String],
+        subdir_filter: Option<&Path>,
     ) -> Result<Vec<colgrep::SearchResult>> {
         let Some(_read_lock) = try_acquire_index_read_lock(&self.index_dir)? else {
             anyhow::bail!(
@@ -579,7 +581,7 @@ impl SearchEngine {
             code_only,
             no_fts: semantic_only,
             alpha: None,
-            subdir_filter: None,
+            subdir_filter,
             specific_file: None,
         };
         let loaded = search_loaded(&self.searcher, &options)?;

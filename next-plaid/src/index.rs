@@ -1022,6 +1022,14 @@ pub fn create_index_with_kmeans_files(
 // Memory-Mapped Index for Low Memory Usage
 // ============================================================================
 
+fn read_only_load_error(index_dir: &Path, reason: &str) -> Error {
+    Error::IndexLoad(format!(
+        "Read-only index load rejected for {}: {}. Run a normal one-shot search or `colgrep init` to prepare the index.",
+        index_dir.display(),
+        reason
+    ))
+}
+
 /// A memory-mapped PLAID index for multi-vector search.
 ///
 /// This struct uses memory-mapped files for the large arrays (codes and residuals)
@@ -1073,6 +1081,19 @@ impl MmapIndex {
     /// If the index was created by fast-plaid, it will be automatically converted
     /// to next-plaid compatible format on first load.
     pub fn load(index_path: &str) -> Result<Self> {
+        Self::load_with_mode(index_path, false)
+    }
+
+    /// Load a memory-mapped index without modifying the index directory.
+    ///
+    /// Unlike [`Self::load`], this rejects indexes that still require fast-plaid
+    /// compatibility conversion or merged-file generation. Run a normal
+    /// one-shot search or `colgrep init` first to prepare such an index.
+    pub fn load_read_only(index_path: &str) -> Result<Self> {
+        Self::load_with_mode(index_path, true)
+    }
+
+    fn load_with_mode(index_path: &str, read_only: bool) -> Result<Self> {
         use ndarray_npy::ReadNpyExt;
 
         let index_dir = Path::new(index_path);
@@ -1082,6 +1103,13 @@ impl MmapIndex {
 
         // Check if conversion from fast-plaid format is needed
         if !metadata.next_plaid_compatible {
+            if read_only {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "fast-plaid compatibility conversion is required",
+                ));
+            }
+
             eprintln!("Checking index format compatibility...");
             let converted = crate::mmap::convert_fastplaid_to_nextplaid(index_dir)?;
             if converted {
@@ -1163,15 +1191,81 @@ impl MmapIndex {
         let last_len = *doc_lengths.last().unwrap_or(&0) as usize;
         let padding_needed = max_len.saturating_sub(last_len);
 
-        let merged_codes_path =
-            crate::mmap::merge_codes_chunks(index_dir, metadata.num_chunks, padding_needed)?;
-        let merged_residuals_path =
-            crate::mmap::merge_residuals_chunks(index_dir, metadata.num_chunks, padding_needed)?;
+        let (mmap_codes, mmap_residuals) = if read_only {
+            let codes = crate::mmap::validate_merged_codes_fast_path(
+                index_dir,
+                metadata.num_chunks,
+                padding_needed,
+            )
+            .ok_or_else(|| {
+                read_only_load_error(
+                    index_dir,
+                    "merged codes or its manifest is missing, stale, or invalid",
+                )
+            })?;
+            let residuals = crate::mmap::validate_merged_residuals_fast_path(
+                index_dir,
+                metadata.num_chunks,
+                padding_needed,
+            )
+            .ok_or_else(|| {
+                read_only_load_error(
+                    index_dir,
+                    "merged residuals or its manifest is missing, stale, or invalid",
+                )
+            })?;
 
-        let (mmap_codes, mmap_residuals) = (
-            crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?,
-            crate::mmap::MmapNpyArray2U8::from_npy_file(&merged_residuals_path)?,
-        );
+            let mmap_codes =
+                crate::mmap::MmapNpyArray1I64::from_npy_file(&codes.path).map_err(|error| {
+                    read_only_load_error(
+                        index_dir,
+                        &format!("merged codes file is invalid: {error}"),
+                    )
+                })?;
+            let mmap_residuals = crate::mmap::MmapNpyArray2U8::from_npy_file(&residuals.path)
+                .map_err(|error| {
+                    read_only_load_error(
+                        index_dir,
+                        &format!("merged residuals file is invalid: {error}"),
+                    )
+                })?;
+
+            if codes.manifest.total_rows != residuals.manifest.total_rows {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged codes and residuals have different row counts",
+                ));
+            }
+            if mmap_codes.len() != codes.manifest.total_rows {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged codes dimensions do not match its manifest",
+                ));
+            }
+            if mmap_residuals.nrows() != residuals.manifest.total_rows
+                || mmap_residuals.ncols() != residuals.manifest.ncols
+            {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged residuals dimensions do not match its manifest",
+                ));
+            }
+
+            (mmap_codes, mmap_residuals)
+        } else {
+            let merged_codes_path =
+                crate::mmap::merge_codes_chunks(index_dir, metadata.num_chunks, padding_needed)?;
+            let merged_residuals_path = crate::mmap::merge_residuals_chunks(
+                index_dir,
+                metadata.num_chunks,
+                padding_needed,
+            )?;
+
+            (
+                crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?,
+                crate::mmap::MmapNpyArray2U8::from_npy_file(&merged_residuals_path)?,
+            )
+        };
 
         Ok(Self {
             path: index_path.to_string(),

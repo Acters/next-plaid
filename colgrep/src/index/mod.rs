@@ -56,6 +56,14 @@ const BUILDING_MARKER: &str = ".building";
 /// more often (more resumable) at the cost of more index-append overhead.
 const BUILD_CHECKPOINT_UNITS: usize = 4096;
 
+/// Bounds for user-supplied include/exclude globs. These are deliberately
+/// shared by protocol validation and index filtering so a request cannot pass
+/// validation and later trigger a larger expansion during execution.
+pub const MAX_GLOB_PATTERNS: usize = 64;
+pub const MAX_GLOB_EXPANSIONS: usize = 256;
+const MAX_GLOB_PATTERN_BYTES: usize = 4096;
+const MAX_GLOB_BRACE_DEPTH: usize = 16;
+
 /// Test-only counter of expensive `delete_from_index` invocations.
 ///
 /// Issue #116: deleting many files used to call the full-index-rewrite primitive once per
@@ -3580,31 +3588,151 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     results
 }
 
-/// Build a GlobSet from patterns for efficient matching
-fn build_glob_set(patterns: &[String]) -> Option<GlobSet> {
-    if patterns.is_empty() {
-        return None;
+fn matching_brace(pattern: &str, start: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (offset, character) in pattern[start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Count brace expansions without constructing them. This runs before the
+/// legacy recursive expander so pathological input cannot make that expander
+/// allocate an unbounded result vector.
+fn count_brace_expansions(pattern: &str, depth: usize, limit: usize) -> Result<usize> {
+    if depth > MAX_GLOB_BRACE_DEPTH {
+        anyhow::bail!("glob brace nesting exceeds {MAX_GLOB_BRACE_DEPTH} levels");
+    }
+    let Some(start) = pattern.find('{') else {
+        return Ok(1);
+    };
+    let Some(end) = matching_brace(pattern, start) else {
+        // Let Glob::new report the malformed pattern after the bounded check.
+        return Ok(1);
+    };
+
+    let prefix = &pattern[..start];
+    let alternatives = &pattern[start + 1..end];
+    let suffix = &pattern[end + 1..];
+    let mut total = 0usize;
+    let mut current = String::new();
+    let mut nested_depth = 0usize;
+
+    let mut count_alternative = |alternative: &str| -> Result<()> {
+        let expanded = format!("{prefix}{alternative}{suffix}");
+        let count = count_brace_expansions(&expanded, depth + 1, limit)?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("glob brace expansion is too large"))?;
+        if total > limit {
+            anyhow::bail!("glob brace expansion exceeds {limit} alternatives");
+        }
+        Ok(())
+    };
+
+    for character in alternatives.chars() {
+        match character {
+            '{' => {
+                nested_depth += 1;
+                current.push(character);
+            }
+            '}' => {
+                nested_depth = nested_depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if nested_depth == 0 => {
+                count_alternative(&current)?;
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() || alternatives.ends_with(',') {
+        count_alternative(&current)?;
     }
 
-    // Expand brace patterns first
-    let expanded_patterns: Vec<String> = patterns.iter().flat_map(|p| expand_braces(p)).collect();
+    Ok(total.max(1))
+}
 
-    let mut builder = GlobSetBuilder::new();
-    for pattern in &expanded_patterns {
-        // Prepend **/ if pattern doesn't start with ** or /
-        // This makes "*.rs" match files in any directory
-        let normalized = if !pattern.starts_with("**/") && !pattern.starts_with('/') {
-            format!("**/{}", pattern)
-        } else {
-            pattern.clone()
-        };
+/// Validate and expand include/exclude globs using the same bounded path used
+/// by index execution. Ordinary brace patterns such as `*.{ts,tsx}` remain
+/// valid; only excessive count, size, nesting, or expansion is rejected.
+pub fn prepare_glob_patterns(patterns: &[String]) -> Result<Vec<String>> {
+    if patterns.len() > MAX_GLOB_PATTERNS {
+        anyhow::bail!(
+            "glob pattern count {} exceeds the limit of {}",
+            patterns.len(),
+            MAX_GLOB_PATTERNS
+        );
+    }
 
-        if let Ok(glob) = Glob::new(&normalized) {
-            builder.add(glob);
+    let mut expansion_count = 0usize;
+    for pattern in patterns {
+        if pattern.is_empty() || pattern.len() > MAX_GLOB_PATTERN_BYTES {
+            anyhow::bail!(
+                "glob pattern length must be between 1 and {MAX_GLOB_PATTERN_BYTES} bytes"
+            );
+        }
+        let count = count_brace_expansions(pattern, 0, MAX_GLOB_EXPANSIONS)?;
+        expansion_count = expansion_count
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("glob expansion is too large"))?;
+        if expansion_count > MAX_GLOB_EXPANSIONS {
+            anyhow::bail!("glob expansion exceeds {MAX_GLOB_EXPANSIONS} alternatives");
         }
     }
 
-    builder.build().ok()
+    let expanded_patterns: Vec<String> = patterns.iter().flat_map(|p| expand_braces(p)).collect();
+    if expanded_patterns.len() > MAX_GLOB_EXPANSIONS {
+        anyhow::bail!("glob expansion exceeds {MAX_GLOB_EXPANSIONS} alternatives");
+    }
+
+    for pattern in &expanded_patterns {
+        let normalized = if !pattern.starts_with("**/") && !pattern.starts_with('/') {
+            format!("**/{pattern}")
+        } else {
+            pattern.clone()
+        };
+        Glob::new(&normalized)
+            .map_err(|error| anyhow::anyhow!("invalid glob {pattern:?}: {error}"))?;
+    }
+
+    Ok(expanded_patterns)
+}
+
+fn build_glob_set_from_expanded(expanded_patterns: &[String]) -> Result<Option<GlobSet>> {
+    if expanded_patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    for pattern in expanded_patterns {
+        // Prepend **/ if pattern doesn't start with ** or /
+        // This makes "*.rs" match files in any directory
+        let normalized = if !pattern.starts_with("**/") && !pattern.starts_with('/') {
+            format!("**/{pattern}")
+        } else {
+            pattern.clone()
+        };
+        builder.add(Glob::new(&normalized)?);
+    }
+
+    Ok(Some(builder.build()?))
+}
+
+/// Build a bounded GlobSet from patterns for efficient matching.
+fn build_glob_set(patterns: &[String]) -> Result<Option<GlobSet>> {
+    let expanded_patterns = prepare_glob_patterns(patterns)?;
+    build_glob_set_from_expanded(&expanded_patterns)
 }
 
 /// Convert a glob pattern to a regex pattern
@@ -3720,7 +3848,7 @@ fn matches_glob_pattern(path: &Path, patterns: &[String]) -> bool {
         return true;
     }
 
-    let Some(glob_set) = build_glob_set(patterns) else {
+    let Ok(Some(glob_set)) = build_glob_set(patterns) else {
         return false;
     };
 
@@ -3743,6 +3871,26 @@ impl Searcher {
         model_id: &str,
         model_path: &Path,
         quantized: bool,
+    ) -> Result<Self> {
+        Self::load_with_quantized_mode(project_root, model_id, model_path, quantized, false)
+    }
+
+    /// Load a searcher without modifying the existing index.
+    pub fn load_read_only_with_quantized(
+        project_root: &Path,
+        model_id: &str,
+        model_path: &Path,
+        quantized: bool,
+    ) -> Result<Self> {
+        Self::load_with_quantized_mode(project_root, model_id, model_path, quantized, true)
+    }
+
+    fn load_with_quantized_mode(
+        project_root: &Path,
+        model_id: &str,
+        model_path: &Path,
+        quantized: bool,
+        read_only: bool,
     ) -> Result<Self> {
         let index_dir = get_index_dir_for_project(project_root, model_id)?;
         let vector_dir = get_vector_index_path(&index_dir);
@@ -3791,7 +3939,12 @@ impl Searcher {
         .context("Failed to load ColBERT model")?;
 
         // Load index
-        let index = MmapIndex::load(&index_path).context("Failed to load index")?;
+        let index = if read_only {
+            MmapIndex::load_read_only(&index_path)
+        } else {
+            MmapIndex::load(&index_path)
+        }
+        .context("Failed to load index")?;
 
         Ok(Self {
             model,
@@ -3888,7 +4041,7 @@ impl Searcher {
         }
 
         // Build globset from patterns
-        let Some(glob_set) = build_glob_set(patterns) else {
+        let Some(glob_set) = build_glob_set(patterns)? else {
             return Ok(vec![]);
         };
 
@@ -3922,9 +4075,11 @@ impl Searcher {
                 .map_err(|e| anyhow::anyhow!("{}", e));
         }
 
-        // Convert glob patterns to regex patterns for SQL REGEXP
-        // e.g., "*.test.ts" -> ".*\\.test\\.ts$"
-        let regex_patterns: Vec<String> = patterns.iter().map(|p| glob_to_regex(p)).collect();
+        // Expand and validate before converting glob patterns to SQL REGEXP.
+        // This keeps exclude behavior bounded and preserves brace expansion.
+        let expanded_patterns = prepare_glob_patterns(patterns)?;
+        let regex_patterns: Vec<String> =
+            expanded_patterns.iter().map(|p| glob_to_regex(p)).collect();
 
         // Build a combined regex: (pattern1|pattern2|...)
         let combined_regex = regex_patterns.join("|");
@@ -4227,8 +4382,11 @@ impl Searcher {
         // read plus a few constant-time score adjustments. We cap at
         // `num_documents()` so we never request more rows than the index
         // actually contains.
+        let overfetch_k = top_k
+            .checked_mul(20)
+            .ok_or_else(|| anyhow::anyhow!("top_k is too large for hybrid search over-fetch"))?;
         let fetch_k = std::cmp::min(
-            std::cmp::max(top_k * 20, 200),
+            std::cmp::max(overfetch_k, 200),
             self.index.num_documents().max(top_k),
         );
         let params = search_params_from_env(fetch_k);

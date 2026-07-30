@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use fs2::FileExt;
@@ -1207,6 +1207,96 @@ fn npy_header_size_2d(nrows: usize, ncols: usize, dtype: &str) -> usize {
     npy_header_layout(&dict).1
 }
 
+/// Details for a merged file that satisfies the same fast-path checks used by
+/// the normal merge loaders.
+#[derive(Debug, Clone)]
+pub(crate) struct MergedFileValidation {
+    pub path: PathBuf,
+    pub manifest: MergeManifest,
+}
+
+/// Validate a merged codes file without taking a lock or touching the index.
+///
+/// Keep these checks aligned with `merge_codes_chunks`' normal fast path. A
+/// read-only load uses this to distinguish a prepared merged file from one
+/// that the normal loader would regenerate.
+pub(crate) fn validate_merged_codes_fast_path(
+    index_path: &Path,
+    num_chunks: usize,
+    padding_rows: usize,
+) -> Option<MergedFileValidation> {
+    let merged_path = index_path.join("merged_codes.npy");
+    let manifest_path = index_path.join("merged_codes.manifest.json");
+    let current_metadata_mtime = get_mtime(&index_path.join("metadata.json")).unwrap_or(0.0);
+    let manifest = load_merge_manifest(&manifest_path)?;
+
+    let mtime_matches = manifest.metadata_mtime > 0.0
+        && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001;
+    if manifest.num_chunks != num_chunks
+        || manifest.padding_rows != padding_rows
+        || manifest.chunks.len() != num_chunks
+        || manifest.total_rows == 0
+        || !mtime_matches
+        || !merged_path.exists()
+    {
+        return None;
+    }
+
+    let expected_size = npy_header_size_1d(manifest.total_rows, "<i8")
+        + manifest.total_rows * std::mem::size_of::<i64>();
+    if fs::metadata(&merged_path)
+        .map(|metadata| metadata.len() == expected_size as u64)
+        .unwrap_or(false)
+    {
+        Some(MergedFileValidation {
+            path: merged_path,
+            manifest,
+        })
+    } else {
+        None
+    }
+}
+
+/// Validate a merged residuals file without taking a lock or touching the
+/// index. This mirrors `merge_residuals_chunks`' normal fast path.
+pub(crate) fn validate_merged_residuals_fast_path(
+    index_path: &Path,
+    num_chunks: usize,
+    padding_rows: usize,
+) -> Option<MergedFileValidation> {
+    let merged_path = index_path.join("merged_residuals.npy");
+    let manifest_path = index_path.join("merged_residuals.manifest.json");
+    let current_metadata_mtime = get_mtime(&index_path.join("metadata.json")).unwrap_or(0.0);
+    let manifest = load_merge_manifest(&manifest_path)?;
+
+    let mtime_matches = manifest.metadata_mtime > 0.0
+        && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001;
+    if manifest.num_chunks != num_chunks
+        || manifest.padding_rows != padding_rows
+        || manifest.chunks.len() != num_chunks
+        || manifest.total_rows == 0
+        || manifest.ncols == 0
+        || !mtime_matches
+        || !merged_path.exists()
+    {
+        return None;
+    }
+
+    let expected_size = npy_header_size_2d(manifest.total_rows, manifest.ncols, "|u1")
+        + manifest.total_rows * manifest.ncols;
+    if fs::metadata(&merged_path)
+        .map(|metadata| metadata.len() == expected_size as u64)
+        .unwrap_or(false)
+    {
+        Some(MergedFileValidation {
+            path: merged_path,
+            manifest,
+        })
+    } else {
+        None
+    }
+}
+
 /// Write an NPY header (shared implementation for 1D and 2D).
 fn write_npy_header(writer: &mut impl Write, header_dict: &str) -> Result<usize> {
     let (padding, total) = npy_header_layout(header_dict);
@@ -1277,26 +1367,10 @@ pub fn merge_codes_chunks(
 
     // Fast path: if manifest exists with matching params, metadata.json hasn't changed,
     // and merged file exists with correct size, skip chunk scanning entirely.
-    let metadata_json_path = index_path.join("metadata.json");
-    let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
-    if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
-        let mtime_matches = manifest.metadata_mtime > 0.0
-            && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001;
-        if manifest.num_chunks == num_chunks
-            && manifest.padding_rows == padding_rows
-            && manifest.chunks.len() == num_chunks
-            && manifest.total_rows > 0
-            && mtime_matches
-            && merged_path.exists()
-        {
-            if let Ok(meta) = std::fs::metadata(&merged_path) {
-                let expected_size = npy_header_size_1d(manifest.total_rows, "<i8")
-                    + manifest.total_rows * std::mem::size_of::<i64>();
-                if meta.len() == expected_size as u64 {
-                    return Ok(merged_path);
-                }
-            }
-        }
+    let current_metadata_mtime = get_mtime(&index_path.join("metadata.json")).unwrap_or(0.0);
+    if let Some(validation) = validate_merged_codes_fast_path(index_path, num_chunks, padding_rows)
+    {
+        return Ok(validation.path);
     }
 
     // Acquire exclusive lock to prevent concurrent merge operations.
@@ -1494,26 +1568,11 @@ pub fn merge_residuals_chunks(
 
     // Fast path: if manifest exists with matching params, metadata.json hasn't changed,
     // and merged file has correct size, skip chunk scanning entirely.
-    let metadata_json_path = index_path.join("metadata.json");
-    let current_metadata_mtime = get_mtime(&metadata_json_path).unwrap_or(0.0);
-    if let Some(ref manifest) = load_merge_manifest(&manifest_path) {
-        if manifest.num_chunks == num_chunks
-            && manifest.padding_rows == padding_rows
-            && manifest.chunks.len() == num_chunks
-            && manifest.total_rows > 0
-            && manifest.ncols > 0
-            && manifest.metadata_mtime > 0.0
-            && (manifest.metadata_mtime - current_metadata_mtime).abs() < 0.001
-            && merged_path.exists()
-        {
-            if let Ok(meta) = std::fs::metadata(&merged_path) {
-                let expected_size = npy_header_size_2d(manifest.total_rows, manifest.ncols, "|u1")
-                    + manifest.total_rows * manifest.ncols;
-                if meta.len() == expected_size as u64 {
-                    return Ok(merged_path);
-                }
-            }
-        }
+    let current_metadata_mtime = get_mtime(&index_path.join("metadata.json")).unwrap_or(0.0);
+    if let Some(validation) =
+        validate_merged_residuals_fast_path(index_path, num_chunks, padding_rows)
+    {
+        return Ok(validation.path);
     }
 
     // Acquire exclusive lock to prevent concurrent merge operations.

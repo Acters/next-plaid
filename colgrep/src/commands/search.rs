@@ -1186,6 +1186,31 @@ pub(crate) struct LoadedSearchResults {
     pub searched: bool,
 }
 
+/// Run the exact text filter in parallel with the initial semantic search.
+///
+/// The scoped thread is always joined before this function returns, including
+/// when either operation fails. A worker panic is converted into an error so a
+/// failure in the exact lookup cannot take down the search process.
+fn run_parallel_exact_filter<T, ExactFilter, SemanticSearch>(
+    exact_filter: ExactFilter,
+    semantic_search: SemanticSearch,
+) -> Result<(Vec<i64>, T)>
+where
+    ExactFilter: FnOnce() -> Result<Vec<i64>> + Send,
+    SemanticSearch: FnOnce() -> Result<T>,
+{
+    std::thread::scope(|scope| {
+        let exact_handle = scope.spawn(exact_filter);
+        let semantic_result = semantic_search();
+        let exact_result = exact_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("exact text filter worker panicked"))?;
+        let exact_ids = exact_result?;
+        let semantic_result = semantic_result?;
+        Ok((exact_ids, semantic_result))
+    })
+}
+
 /// Apply the deterministic final result policy shared by CLI and server.
 pub(crate) fn finalize_results(
     mut results: Vec<colgrep::SearchResult>,
@@ -1418,42 +1443,50 @@ pub(crate) fn search_loaded(
             )?
         }
     } else {
-        // Encode query once and reuse across both searches
-        let query_emb = searcher.encode_query(query)?;
+        // Start the exact lookup before encoding the query so its metadata scan
+        // overlaps the initial semantic/hybrid search. The returned embedding
+        // is retained for the exact-subset rerank below.
+        let (text_filtered_ids, (query_emb, semantic_results)) = run_parallel_exact_filter(
+            || searcher.filter_by_text_pattern_with_options(query, false, true, false, false),
+            || {
+                // Encode query once and reuse across both searches
+                let query_emb = searcher.encode_query(query)?;
 
-        // Run FTS5 once and reuse across both searches
-        let fts5_results = if hybrid_disabled {
-            None
-        } else {
-            searcher.fts5_search(
-                query,
-                search_top_k.checked_mul(3).ok_or_else(|| {
-                    anyhow::anyhow!("top_k is too large for the FTS over-fetch multiplier")
-                })?,
-                subset.as_deref(),
-            )
-        };
+                // Run FTS5 once and reuse across both searches
+                let fts5_results = if hybrid_disabled {
+                    None
+                } else {
+                    searcher.fts5_search(
+                        query,
+                        search_top_k.checked_mul(3).ok_or_else(|| {
+                            anyhow::anyhow!("top_k is too large for the FTS over-fetch multiplier")
+                        })?,
+                        subset.as_deref(),
+                    )
+                };
 
-        // 1. Run semantic search (with FTS5 fusion if enabled)
-        let semantic_results = if hybrid_disabled {
-            searcher.search_with_embedding(&query_emb, search_top_k, subset.as_deref())?
-        } else {
-            searcher.search_hybrid_with_embedding(
-                &query_emb,
-                query,
-                search_top_k,
-                subset.as_deref(),
-                hybrid_alpha,
-                fts5_results.as_ref(),
-            )?
-        };
+                // 1. Run semantic search (with FTS5 fusion if enabled)
+                let semantic_results = if hybrid_disabled {
+                    searcher.search_with_embedding(&query_emb, search_top_k, subset.as_deref())?
+                } else {
+                    searcher.search_hybrid_with_embedding(
+                        &query_emb,
+                        query,
+                        search_top_k,
+                        subset.as_deref(),
+                        hybrid_alpha,
+                        fts5_results.as_ref(),
+                    )?
+                };
+
+                Ok((query_emb, semantic_results))
+            },
+        )?;
 
         // 2. Run hybrid search: filter by query text, then semantic rank
         // Use fixed_strings mode to treat the query as a literal pattern.
         // The semantic-side query is *always* case-insensitive — ColBERT
         // embeddings handle case fuzzily and we want broad recall here.
-        let text_filtered_ids =
-            searcher.filter_by_text_pattern_with_options(query, false, true, false, false)?;
 
         let hybrid_results = if !text_filtered_ids.is_empty() {
             // Intersect with existing subset if any
@@ -2024,6 +2057,136 @@ mod tests {
             cmp_results_deterministic(&short, &long),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn parallel_exact_filter_joins_and_returns_both_results() {
+        let (exact_ids, semantic_result) = run_parallel_exact_filter(
+            || Ok::<_, anyhow::Error>(vec![1, 2, 3]),
+            || Ok::<_, anyhow::Error>("semantic result"),
+        )
+        .unwrap();
+
+        assert_eq!(exact_ids, vec![1, 2, 3]);
+        assert_eq!(semantic_result, "semantic result");
+    }
+
+    #[test]
+    fn parallel_exact_filter_starts_exact_worker_before_semantic_and_overlaps() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(1);
+        let (exact_started_tx, exact_started_rx) = mpsc::channel();
+        let (semantic_started_tx, semantic_started_rx) = mpsc::channel();
+
+        let (exact_ids, semantic_result) = run_parallel_exact_filter(
+            move || {
+                exact_started_tx
+                    .send(())
+                    .expect("semantic closure should receive the exact-worker start signal");
+                semantic_started_rx
+                    .recv_timeout(TIMEOUT)
+                    .map_err(|_| anyhow::anyhow!("semantic closure did not start in time"))?;
+                Ok::<_, anyhow::Error>(vec![1, 2, 3])
+            },
+            || {
+                exact_started_rx.recv_timeout(TIMEOUT).map_err(|_| {
+                    anyhow::anyhow!("exact worker did not start before semantic search")
+                })?;
+                semantic_started_tx
+                    .send(())
+                    .expect("exact worker should still be waiting for semantic search");
+                Ok::<_, anyhow::Error>("semantic result")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exact_ids, vec![1, 2, 3]);
+        assert_eq!(semantic_result, "semantic result");
+    }
+
+    #[test]
+    fn parallel_exact_filter_propagates_worker_error() {
+        let error = run_parallel_exact_filter(
+            || Err::<Vec<i64>, _>(anyhow::anyhow!("exact filter failed")),
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exact filter failed"));
+    }
+
+    #[test]
+    fn parallel_exact_filter_converts_worker_panic_to_error() {
+        let error = run_parallel_exact_filter(
+            || -> Result<Vec<i64>> { panic!("exact filter panic") },
+            || Ok::<_, anyhow::Error>(()),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("exact text filter worker panicked"));
+    }
+
+    #[test]
+    fn parallel_exact_filter_joins_worker_before_semantic_error_returns() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(1);
+        let (worker_started_tx, worker_started_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let (semantic_complete_tx, semantic_complete_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let controller = std::thread::spawn(move || {
+            let result = run_parallel_exact_filter(
+                move || {
+                    worker_started_tx
+                        .send(())
+                        .expect("controller should still be waiting for the worker");
+                    release_worker_rx
+                        .recv_timeout(TIMEOUT)
+                        .map_err(|_| anyhow::anyhow!("test timed out waiting to release worker"))?;
+                    Ok::<_, anyhow::Error>(vec![])
+                },
+                || {
+                    semantic_complete_tx
+                        .send(())
+                        .expect("controller should observe semantic completion");
+                    Err::<(), _>(anyhow::anyhow!("semantic search failed"))
+                },
+            );
+            result_tx
+                .send(result)
+                .expect("test should receive the helper result");
+        });
+
+        worker_started_rx
+            .recv_timeout(TIMEOUT)
+            .expect("exact worker did not start in time");
+        semantic_complete_rx
+            .recv_timeout(TIMEOUT)
+            .expect("semantic search did not complete in time");
+
+        // The semantic side has returned, but the exact worker is still blocked.
+        // A premature result would prove that the helper skipped its join.
+        let returned_before_release = result_rx.recv_timeout(Duration::from_millis(100));
+
+        let _ = release_worker_tx.send(());
+        let result = result_rx
+            .recv_timeout(TIMEOUT)
+            .expect("helper did not return after the exact worker was released");
+        controller.join().expect("controller thread panicked");
+
+        assert!(
+            returned_before_release.is_err(),
+            "helper returned while exact worker was still blocked"
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("semantic search failed"));
     }
 
     // Test strip_regex_for_semantic function

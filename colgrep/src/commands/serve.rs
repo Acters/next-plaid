@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -17,6 +17,7 @@ const MAX_TOP_K: usize = 1000;
 /// The small interface used by the protocol loop. Keeping the loop generic
 /// makes request/response behavior testable without loading ONNX models.
 pub(crate) trait SearchService {
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         query: &str,
@@ -25,6 +26,7 @@ pub(crate) trait SearchService {
         code_only: bool,
         include_patterns: &[String],
         exclude_patterns: &[String],
+        subdir_filter: Option<&Path>,
     ) -> Result<Vec<SearchResult>>;
 
     fn health(&self) -> HealthInfo;
@@ -48,6 +50,7 @@ impl SearchService for SearchEngine {
         code_only: bool,
         include_patterns: &[String],
         exclude_patterns: &[String],
+        subdir_filter: Option<&Path>,
     ) -> Result<Vec<SearchResult>> {
         self.search(
             query,
@@ -56,6 +59,7 @@ impl SearchService for SearchEngine {
             code_only,
             include_patterns,
             exclude_patterns,
+            subdir_filter,
         )
     }
 
@@ -157,6 +161,7 @@ struct Request {
     include: Vec<String>,
     #[serde(default, alias = "exclude_patterns")]
     exclude: Vec<String>,
+    restrict_to_dir: Option<PathBuf>,
 }
 
 struct ProtocolError {
@@ -206,8 +211,36 @@ fn validate_globs(
     }
 }
 
+fn normalize_restrict_to_dir(value: &Path) -> std::result::Result<PathBuf, String> {
+    if value.as_os_str().is_empty() {
+        return Err("restrict_to_dir must name a descendant directory".to_string());
+    }
+    if value.to_string_lossy().contains('\0') {
+        return Err("restrict_to_dir must not contain a NUL byte".to_string());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in value.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("restrict_to_dir must be a relative path".to_string());
+            }
+            Component::ParentDir => {
+                return Err("restrict_to_dir must not contain parent traversal".to_string());
+            }
+            Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err("restrict_to_dir must name a descendant directory".to_string());
+    }
+    Ok(normalized)
+}
+
 fn validate_request(
-    request: Request,
+    mut request: Request,
     default_top_k: usize,
 ) -> std::result::Result<Request, ProtocolError> {
     if request.id.is_none() {
@@ -259,6 +292,18 @@ fn validate_request(
                     message: "search query must not be empty".to_string(),
                 });
             }
+            request.restrict_to_dir = match request.restrict_to_dir.as_deref() {
+                Some(value) => {
+                    Some(
+                        normalize_restrict_to_dir(value).map_err(|message| ProtocolError {
+                            op: Some(op.to_string()),
+                            code: "invalid_restriction",
+                            message,
+                        })?,
+                    )
+                }
+                None => None,
+            };
             if request.top_k.unwrap_or(default_top_k) > MAX_TOP_K {
                 return Err(ProtocolError {
                     op: Some(op.to_string()),
@@ -322,6 +367,7 @@ fn handle_request<S: SearchService>(service: &S, request: Request) -> Value {
             request.code_only.unwrap_or(false),
             &request.include,
             &request.exclude,
+            request.restrict_to_dir.as_deref(),
         ) {
             Ok(results) => match serialize_results(results) {
                 Ok(results) => {
@@ -492,6 +538,7 @@ mod tests {
         code_only: bool,
         include_patterns: Vec<String>,
         exclude_patterns: Vec<String>,
+        subdir_filter: Option<PathBuf>,
     }
 
     struct MockService {
@@ -527,6 +574,7 @@ mod tests {
             code_only: bool,
             include_patterns: &[String],
             exclude_patterns: &[String],
+            subdir_filter: Option<&Path>,
         ) -> Result<Vec<SearchResult>> {
             self.searches.borrow_mut().push(SearchCall {
                 query: query.to_string(),
@@ -535,6 +583,7 @@ mod tests {
                 code_only,
                 include_patterns: include_patterns.to_vec(),
                 exclude_patterns: exclude_patterns.to_vec(),
+                subdir_filter: subdir_filter.map(Path::to_path_buf),
             });
             if self.backend_error {
                 return Err(anyhow::anyhow!("backend unavailable"));
@@ -611,6 +660,10 @@ mod tests {
             r#"{"version":1,"id":"empty","op":"search","query":""}"#,
             r#"{"version":1,"id":"limit","op":"search","query":"x","top_k":1001}"#,
             r#"{"version":1,"id":"glob","op":"search","query":"x","include":["["]}"#,
+            r#"{"version":1,"id":"absolute","op":"search","query":"x","restrict_to_dir":"/outside"}"#,
+            r#"{"version":1,"id":"parent","op":"search","query":"x","restrict_to_dir":"src/../outside"}"#,
+            r#"{"version":1,"id":"empty","op":"search","query":"x","restrict_to_dir":""}"#,
+            r#"{"version":1,"id":"current","op":"search","query":"x","restrict_to_dir":"."}"#,
         ];
         let expected = [
             "invalid_json",
@@ -623,6 +676,10 @@ mod tests {
             "empty_query",
             "top_k_too_large",
             "invalid_glob",
+            "invalid_restriction",
+            "invalid_restriction",
+            "invalid_restriction",
+            "invalid_restriction",
         ];
         let service = MockService::default();
         let mut input = cases.join("\n");
@@ -635,6 +692,42 @@ mod tests {
             .collect();
         assert_eq!(codes, expected);
         assert!(service.searches.borrow().is_empty());
+    }
+
+    #[test]
+    fn restriction_errors_echo_the_request_as_normal_search_errors() {
+        let service = MockService::default();
+        let responses = run(
+            "{\"version\":1,\"id\":\"bad-path\",\"op\":\"search\",\"query\":\"x\",\"restrict_to_dir\":\"../outside\"}\n\
+             {\"version\":1,\"id\":\"stop\",\"op\":\"shutdown\"}\n",
+            &service,
+        );
+        assert_eq!(responses[0]["version"], 1);
+        assert_eq!(responses[0]["id"], "bad-path");
+        assert_eq!(responses[0]["ok"], false);
+        assert_eq!(responses[0]["op"], "search");
+        assert_eq!(responses[0]["error"]["code"], "invalid_restriction");
+        assert_eq!(responses[1]["ok"], true);
+        assert!(service.searches.borrow().is_empty());
+    }
+
+    #[test]
+    fn restriction_paths_are_normalized_without_filesystem_access() {
+        assert_eq!(
+            normalize_restrict_to_dir(Path::new("./src//nested/./code")).unwrap(),
+            PathBuf::from("src/nested/code")
+        );
+        for value in ["", ".", "./", "../outside", "src/../../outside", "/outside"] {
+            assert!(
+                normalize_restrict_to_dir(Path::new(value)).is_err(),
+                "{value}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(normalize_restrict_to_dir(Path::new(r"C:\\outside")).is_err());
+            assert!(normalize_restrict_to_dir(Path::new(r"\\server\\share")).is_err());
+        }
     }
 
     #[test]
@@ -659,7 +752,7 @@ mod tests {
     fn default_top_k_is_forwarded_and_explicit_options_are_preserved() {
         let service = MockService::default();
         let responses = run(
-            "{\"version\":1,\"id\":17,\"op\":\"search\",\"query\":\"auth\",\"semantic_only\":true,\"code_only\":true,\"include\":[\"*.rs\"],\"exclude\":[\"*test*\"]}\n\
+            "{\"version\":1,\"id\":17,\"op\":\"search\",\"query\":\"auth\",\"semantic_only\":true,\"code_only\":true,\"include\":[\"*.rs\"],\"exclude\":[\"*test*\"],\"restrict_to_dir\":\"./src//nested\"}\n\
              {\"version\":1,\"id\":\"explicit\",\"op\":\"search\",\"query\":\"auth\",\"top_k\":7}\n\
              {\"version\":1,\"id\":\"stop\",\"op\":\"shutdown\"}\n",
             &service,
@@ -677,6 +770,7 @@ mod tests {
                     code_only: true,
                     include_patterns: vec!["*.rs".to_string()],
                     exclude_patterns: vec!["*test*".to_string()],
+                    subdir_filter: Some(PathBuf::from("src/nested")),
                 },
                 SearchCall {
                     query: "auth".to_string(),
@@ -685,6 +779,7 @@ mod tests {
                     code_only: false,
                     include_patterns: vec![],
                     exclude_patterns: vec![],
+                    subdir_filter: None,
                 },
             ]
         );

@@ -306,6 +306,23 @@ pub fn ensure_model(model_id: Option<&str>, _quiet: bool) -> Result<PathBuf> {
     })
 }
 
+/// Resolve the precision that is actually loadable from `model_dir`.
+///
+/// `requested` follows the user's `--fp32`/`--int8` preference (or the per-build
+/// default), but a repo may ship only one variant. Falling back keeps a
+/// FP32-only or INT8-only model usable instead of failing at session load.
+pub fn resolve_quantized(model_dir: &std::path::Path, requested: bool) -> bool {
+    let has_int8 = model_dir.join("model_int8.onnx").exists();
+    let has_fp32 = model_dir.join("model.onnx").exists();
+    match (requested, has_int8, has_fp32) {
+        // Wanted INT8, only FP32 shipped.
+        (true, false, true) => false,
+        // Wanted FP32, only INT8 shipped.
+        (false, true, false) => true,
+        _ => requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,22 +571,5 @@ mod tests {
         symlink(&outside, &file).unwrap();
 
         assert!(cached_snapshot(model_id, &cache).is_none());
-    }
-}
-
-/// Resolve the precision that is actually loadable from `model_dir`.
-///
-/// `requested` follows the user's `--fp32`/`--int8` preference (or the per-build
-/// default), but a repo may ship only one variant. Falling back keeps a
-/// FP32-only or INT8-only model usable instead of failing at session load.
-pub fn resolve_quantized(model_dir: &std::path::Path, requested: bool) -> bool {
-    let has_int8 = model_dir.join("model_int8.onnx").exists();
-    let has_fp32 = model_dir.join("model.onnx").exists();
-    match (requested, has_int8, has_fp32) {
-        // Wanted INT8, only FP32 shipped.
-        (true, false, true) => false,
-        // Wanted FP32, only INT8 shipped.
-        (false, true, false) => true,
-        _ => requested,
     }
 }

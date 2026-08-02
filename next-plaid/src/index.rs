@@ -1259,14 +1259,33 @@ impl MmapIndex {
         )
         .map_err(|e| Error::IndexLoad(format!("Failed to read ivf_lengths.npy: {}", e)))?;
 
-        // Compute IVF offsets
+        // Compute IVF offsets with checked arithmetic and reject dimensions that
+        // cannot index the mapped IVF array.
         let num_centroids = ivf_lengths.len();
         let mut ivf_offsets = Array1::<i64>::zeros(num_centroids + 1);
+        let mut ivf_offset = 0usize;
         for i in 0..num_centroids {
-            ivf_offsets[i + 1] = ivf_offsets[i] + ivf_lengths[i] as i64;
+            if ivf_lengths[i] < 0 {
+                return Err(Error::IndexLoad(
+                    "IVF lengths must not be negative".to_string(),
+                ));
+            }
+            ivf_offset = ivf_offset
+                .checked_add(ivf_lengths[i] as usize)
+                .ok_or_else(|| Error::IndexLoad("IVF offset count overflows usize".to_string()))?;
+            ivf_offsets[i + 1] = ivf_offset as i64;
+        }
+        if ivf_offset > ivf.len() {
+            return Err(Error::IndexLoad(format!(
+                "IVF lengths address {} values, but ivf.npy contains {}",
+                ivf_offset,
+                ivf.len()
+            )));
         }
 
-        // Load document lengths from all chunks
+        // Load document lengths from all chunks. Validate before arithmetic so
+        // malformed metadata/doclens cannot create huge allocations, negative
+        // casts, or offsets outside the mapped arrays.
         let mut doc_lengths_vec: Vec<i64> = Vec::with_capacity(metadata.num_documents);
         for chunk_idx in 0..metadata.num_chunks {
             let doclens_path = index_dir.join(format!("doclens.{}.json", chunk_idx));
@@ -1274,12 +1293,35 @@ impl MmapIndex {
                 serde_json::from_reader(BufReader::new(File::open(&doclens_path)?))?;
             doc_lengths_vec.extend(chunk_doclens);
         }
+        if doc_lengths_vec.len() != metadata.num_documents {
+            return Err(Error::IndexLoad(format!(
+                "metadata declares {} documents, but doclens contain {}",
+                metadata.num_documents,
+                doc_lengths_vec.len()
+            )));
+        }
+        if doc_lengths_vec.iter().any(|length| *length < 0) {
+            return Err(Error::IndexLoad(
+                "document lengths must not be negative".to_string(),
+            ));
+        }
         let doc_lengths = Array1::from_vec(doc_lengths_vec);
 
-        // Compute document offsets for indexing
+        // Compute document offsets for indexing with checked arithmetic.
         let mut doc_offsets = Array1::<usize>::zeros(doc_lengths.len() + 1);
+        let mut total_doc_tokens = 0usize;
         for i in 0..doc_lengths.len() {
-            doc_offsets[i + 1] = doc_offsets[i] + doc_lengths[i] as usize;
+            let length = doc_lengths[i] as usize;
+            total_doc_tokens = total_doc_tokens.checked_add(length).ok_or_else(|| {
+                Error::IndexLoad("document token count overflows usize".to_string())
+            })?;
+            doc_offsets[i + 1] = total_doc_tokens;
+        }
+        if total_doc_tokens != metadata.num_embeddings {
+            return Err(Error::IndexLoad(format!(
+                "metadata declares {} embeddings, but doclens contain {}",
+                metadata.num_embeddings, total_doc_tokens
+            )));
         }
 
         // Compute padding needed for StridedTensor compatibility
@@ -1344,6 +1386,29 @@ impl MmapIndex {
                 return Err(read_only_load_error(
                     index_dir,
                     "merged residuals dimensions do not match its manifest",
+                ));
+            }
+            if mmap_codes.len() != total_doc_tokens + padding_needed {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged codes row count does not match validated doclens and padding",
+                ));
+            }
+            if mmap_residuals.nrows() != total_doc_tokens + padding_needed {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged residuals row count does not match validated doclens and padding",
+                ));
+            }
+            if metadata.embedding_dim != 0
+                && mmap_residuals
+                    .ncols()
+                    .checked_mul(8)
+                    .is_none_or(|packed_bits| packed_bits < metadata.embedding_dim)
+            {
+                return Err(read_only_load_error(
+                    index_dir,
+                    "merged residuals do not contain enough packed bits for the embedding dimension",
                 ));
             }
 

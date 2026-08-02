@@ -9,7 +9,6 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -266,14 +265,27 @@ fn open_existing_index_lock(index_dir: &Path) -> Result<File> {
         })
 }
 
+fn lock_error_is_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock || {
+        let contended = fs2::lock_contended_error();
+        error.raw_os_error() == contended.raw_os_error()
+    }
+}
+
 /// Try to acquire the index lock without waiting.
 /// Returns `Ok(Some(file))` if acquired, `Ok(None)` if another process holds it.
 pub fn try_acquire_index_lock(index_dir: &Path) -> Result<Option<File>> {
     let lock_file = open_index_lock(index_dir)?;
 
-    match lock_file.try_lock_exclusive() {
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => Ok(Some(lock_file)),
-        Err(_) => Ok(None),
+        Err(error) if lock_error_is_contention(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to acquire exclusive index lock at {}",
+                get_lock_path(index_dir).display()
+            )
+        }),
     }
 }
 
@@ -283,9 +295,15 @@ pub fn try_acquire_index_lock(index_dir: &Path) -> Result<Option<File>> {
 pub fn try_acquire_index_read_lock(index_dir: &Path) -> Result<Option<File>> {
     let lock_file = open_existing_index_lock(index_dir)?;
 
-    match lock_file.try_lock_shared() {
+    match fs2::FileExt::try_lock_shared(&lock_file) {
         Ok(()) => Ok(Some(lock_file)),
-        Err(_) => Ok(None),
+        Err(error) if lock_error_is_contention(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to acquire shared index lock at {}",
+                get_lock_path(index_dir).display()
+            )
+        }),
     }
 }
 
@@ -301,14 +319,24 @@ pub fn acquire_index_read_lock(index_dir: &Path) -> Result<File> {
 
     let start = Instant::now();
     loop {
-        match lock_file.try_lock_shared() {
+        match fs2::FileExt::try_lock_shared(&lock_file) {
             Ok(()) => return Ok(lock_file),
-            Err(_) if start.elapsed() < TIMEOUT => std::thread::sleep(RETRY_INTERVAL),
-            Err(_) => {
+            Err(error) if lock_error_is_contention(&error) && start.elapsed() < TIMEOUT => {
+                std::thread::sleep(RETRY_INTERVAL)
+            }
+            Err(error) if lock_error_is_contention(&error) => {
                 return Err(anyhow::anyhow!(
                     "Timed out waiting for shared index lock after 5 seconds. \
                      Another colgrep instance may be updating this index."
                 ));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to acquire shared index lock at {}",
+                        get_lock_path(index_dir).display()
+                    )
+                });
             }
         }
     }
@@ -327,14 +355,24 @@ pub fn acquire_index_lock(index_dir: &Path) -> Result<File> {
 
     let start = Instant::now();
     loop {
-        match lock_file.try_lock_exclusive() {
+        match fs2::FileExt::try_lock_exclusive(&lock_file) {
             Ok(()) => return Ok(lock_file),
-            Err(_) if start.elapsed() < TIMEOUT => std::thread::sleep(RETRY_INTERVAL),
-            Err(_) => {
+            Err(error) if lock_error_is_contention(&error) && start.elapsed() < TIMEOUT => {
+                std::thread::sleep(RETRY_INTERVAL)
+            }
+            Err(error) if lock_error_is_contention(&error) => {
                 return Err(anyhow::anyhow!(
                     "Timed out waiting for index lock after 5 seconds. \
                      Another colgrep instance may be updating this index."
                 ));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to acquire exclusive index lock at {}",
+                        get_lock_path(index_dir).display()
+                    )
+                });
             }
         }
     }
@@ -382,6 +420,22 @@ mod tests {
     /// non-blocking attempt from another handle must report contention rather
     /// than succeed. Worktree seeding relies on this to skip a busy sibling
     /// instead of copying a store that is being rewritten under it.
+    #[test]
+    fn lock_error_classification_is_limited_to_contention() {
+        assert!(lock_error_is_contention(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "would block"
+        )));
+        assert!(!lock_error_is_contention(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied"
+        )));
+        assert!(!lock_error_is_contention(&std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported"
+        )));
+    }
+
     #[test]
     fn test_try_acquire_index_lock_reports_contention() {
         let dir = tempfile::tempdir().unwrap();

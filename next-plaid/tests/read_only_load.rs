@@ -47,6 +47,10 @@ fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, FileSnapshot> {
 }
 
 fn prepared_index() -> TempDir {
+    prepared_index_with_batch(64)
+}
+
+fn prepared_index_with_batch(batch_size: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let mut rng = StdRng::seed_from_u64(7);
     let documents: Vec<Array2<f32>> = (0..12)
@@ -54,7 +58,7 @@ fn prepared_index() -> TempDir {
         .collect();
     let config = IndexConfig {
         nbits: 2,
-        batch_size: 64,
+        batch_size,
         seed: Some(42),
         force_cpu: true,
         ..Default::default()
@@ -142,4 +146,63 @@ fn invalid_merged_files_are_rejected_without_writes() {
         fs::write(path, bytes).unwrap();
         assert_read_only_failure_without_writes(&dir);
     }
+}
+
+#[test]
+fn malformed_document_lengths_are_rejected_without_writes() {
+    let dir = prepared_index_with_batch(8);
+    let mut doclens: Vec<i64> =
+        serde_json::from_reader(fs::File::open(dir.path().join("doclens.0.json")).unwrap())
+            .unwrap();
+    doclens[0] = -1;
+    fs::write(
+        dir.path().join("doclens.0.json"),
+        serde_json::to_vec(&doclens).unwrap(),
+    )
+    .unwrap();
+
+    let error = match MmapIndex::load_read_only(dir.path().to_str().unwrap()) {
+        Ok(_) => panic!("read-only load unexpectedly accepted malformed doclens"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("negative"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn mismatched_document_count_and_embedding_total_are_rejected_without_writes() {
+    for (metadata_key, value, expected) in [
+        ("num_documents", 13, "documents"),
+        ("num_embeddings", 37, "embeddings"),
+    ] {
+        let dir = prepared_index_with_batch(8);
+        let metadata_path = dir.path().join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_reader(fs::File::open(&metadata_path).unwrap()).unwrap();
+        metadata[metadata_key] = json!(value);
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let error = match MmapIndex::load_read_only(dir.path().to_str().unwrap()) {
+            Ok(_) => panic!("read-only load unexpectedly accepted inconsistent metadata"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error for {metadata_key}: {error}"
+        );
+    }
+}
+
+#[test]
+fn merged_row_counts_must_match_validated_doclens_without_writes() {
+    let dir = prepared_index_with_batch(8);
+    let manifest_path = dir.path().join("merged_codes.manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_reader(fs::File::open(&manifest_path).unwrap()).unwrap();
+    manifest["total_rows"] = json!(manifest["total_rows"].as_u64().unwrap() + 1);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    assert_read_only_failure_without_writes(&dir);
 }

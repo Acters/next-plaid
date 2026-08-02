@@ -32,6 +32,15 @@ pub(crate) trait SearchService {
     fn health(&self) -> HealthInfo;
 
     fn default_top_k(&self) -> usize;
+
+    /// Estimate the serialized search-result payload before JSON materialization.
+    ///
+    /// The default is deliberately conservative. Implementations that return a
+    /// finite estimate avoid the protocol's unbounded fallback serialization.
+    fn estimate_serialized_results_bytes(&self, results: &[SearchResult]) -> Option<usize> {
+        let _ = results;
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +83,42 @@ impl SearchService for SearchEngine {
     fn default_top_k(&self) -> usize {
         self.configured_top_k().min(MAX_TOP_K)
     }
+
+    fn estimate_serialized_results_bytes(&self, results: &[SearchResult]) -> Option<usize> {
+        Some(estimate_search_results_json_bytes(results))
+    }
+}
+
+fn estimate_search_results_json_bytes(results: &[SearchResult]) -> usize {
+    // Exact field/number overhead plus string lengths. Escaped JSON strings are
+    // longer than their raw UTF-8 values, so inflate string payloads by a fixed
+    // factor and add a final 25% safety margin.
+    let per_result = 512usize;
+    let estimated = results.iter().fold(2usize, |total, result| {
+        let unit = &result.unit;
+        let strings = [
+            unit.name.len(),
+            unit.qualified_name.len(),
+            unit.file.to_string_lossy().len(),
+            unit.signature.len(),
+            unit.code.len(),
+            unit.docstring.as_deref().map_or(0, str::len),
+            unit.return_type.as_deref().map_or(0, str::len),
+            unit.extends.as_deref().map_or(0, str::len),
+            unit.parent_class.as_deref().map_or(0, str::len),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(unit.parameters.iter().map(String::len).sum::<usize>())
+        .saturating_add(unit.calls.iter().map(String::len).sum::<usize>())
+        .saturating_add(unit.called_by.iter().map(String::len).sum::<usize>())
+        .saturating_add(unit.variables.iter().map(String::len).sum::<usize>())
+        .saturating_add(unit.imports.iter().map(String::len).sum::<usize>());
+        total
+            .saturating_add(per_result)
+            .saturating_add(strings.saturating_mul(2))
+    });
+    estimated.saturating_add(estimated / 4)
 }
 
 /// Start the explicitly selected stdio transport.
@@ -332,13 +377,25 @@ enum SerializedResultsError {
     Serialization(String),
 }
 
-fn serialize_results(
+fn serialize_results<S: SearchService>(
+    service: &S,
     results: Vec<SearchResult>,
 ) -> std::result::Result<Value, SerializedResultsError> {
     if results.iter().any(|result| !result.score.is_finite()) {
         return Err(SerializedResultsError::Serialization(
             "search result contains a non-finite score".to_string(),
         ));
+    }
+
+    // Reject an obviously oversized result before serializing it. If the
+    // service cannot provide a useful estimate, retain bounded verification
+    // with the existing byte-cap serialization path.
+    if let Some(estimated_bytes) = service.estimate_serialized_results_bytes(&results) {
+        if estimated_bytes > MAX_RESULT_PAYLOAD_BYTES {
+            return Err(SerializedResultsError::TooLarge {
+                bytes: estimated_bytes,
+            });
+        }
     }
 
     // Serialize to bytes first. Only after the byte cap passes do we parse the
@@ -369,7 +426,7 @@ fn handle_request<S: SearchService>(service: &S, request: Request) -> Value {
             &request.exclude,
             request.restrict_to_dir.as_deref(),
         ) {
-            Ok(results) => match serialize_results(results) {
+            Ok(results) => match serialize_results(service, results) {
                 Ok(results) => {
                     let mut response = object_with_id(id, true, Some("search"));
                     response.insert("results".to_string(), results);
@@ -634,6 +691,10 @@ mod tests {
         fn default_top_k(&self) -> usize {
             self.default_top_k
         }
+
+        fn estimate_serialized_results_bytes(&self, results: &[SearchResult]) -> Option<usize> {
+            Some(estimate_search_results_json_bytes(results))
+        }
     }
 
     fn run(input: &str, service: &MockService) -> Vec<Value> {
@@ -741,11 +802,59 @@ mod tests {
         let error = validate_globs(&[pathological], "include").unwrap_err();
         assert_eq!(error.code, "glob_too_large");
 
+        let exact_pattern_count = (0..MAX_GLOB_PATTERNS)
+            .map(|index| format!("file{index}.rs"))
+            .collect::<Vec<_>>();
+        assert!(validate_globs(&exact_pattern_count, "include").is_ok());
         let too_many = (0..=MAX_GLOB_PATTERNS)
             .map(|index| format!("file{index}.rs"))
             .collect::<Vec<_>>();
         let error = validate_globs(&too_many, "exclude").unwrap_err();
         assert_eq!(error.code, "glob_too_large");
+
+        let exact_expansion = (0..8).map(|_| "{a,b}").collect::<Vec<_>>().join("");
+        assert!(validate_globs(&[exact_expansion], "include").is_ok());
+        let over_expansion = (0..9).map(|_| "{a,b}").collect::<Vec<_>>().join("");
+        let error = validate_globs(&[over_expansion], "include").unwrap_err();
+        assert_eq!(error.code, "glob_too_large");
+
+        let exact_length = "x".repeat(4096);
+        assert!(validate_globs(&[exact_length], "include").is_ok());
+        let too_long = "x".repeat(4097);
+        let error = validate_globs(&[too_long], "include").unwrap_err();
+        assert_eq!(error.code, "glob_too_large");
+
+        let nested_over_limit = (0..15).map(|_| "{a,").collect::<String>() + "a" + &"}".repeat(15);
+        let error = validate_globs(&[nested_over_limit], "include").unwrap_err();
+        assert!(
+            matches!(error.code, "glob_too_large" | "invalid_glob"),
+            "deep nesting must be rejected before execution: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn parseable_requests_with_invalid_field_types_are_protocol_errors() {
+        let cases = [
+            r#"{"version":1,"id":"query-number","op":"search","query":1}"#,
+            r#"{"version":1,"id":"top-k-negative","op":"search","query":"x","top_k":-1}"#,
+            r#"{"version":1,"id":"include-string","op":"search","query":"x","include":"*.rs"}"#,
+            r#"{"version":1,"id":"semantic-string","op":"search","query":"x","semantic_only":"yes"}"#,
+        ];
+        let service = MockService::default();
+        let mut input = cases.join("\n");
+        input.push_str("\n{\"version\":1,\"id\":\"after\",\"op\":\"health\"}\n");
+        let responses = run(&input, &service);
+
+        assert_eq!(responses.len(), cases.len() + 1);
+        for (index, response) in responses.iter().take(cases.len()).enumerate() {
+            assert_eq!(response["ok"], false, "case {index}");
+            assert_eq!(response["error"]["code"], "invalid_json", "case {index}");
+            assert_eq!(response["id"], serde_json::Value::Null, "case {index}");
+        }
+        assert_eq!(responses[cases.len()]["id"], "after");
+        assert_eq!(responses[cases.len()]["ok"], true);
+        assert!(service.searches.borrow().is_empty());
     }
 
     #[test]

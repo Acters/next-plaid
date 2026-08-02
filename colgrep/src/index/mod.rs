@@ -4231,34 +4231,56 @@ impl Searcher {
     /// Returns document IDs where file path starts with the given prefix.
     pub fn filter_by_path_prefix(&self, prefix: &Path) -> Result<Vec<i64>> {
         let prefix_str = prefix.to_string_lossy();
-        // Use SQL LIKE with the prefix followed by %
-        let like_pattern = format!("{}%", prefix_str);
+        if prefix_str.is_empty() || prefix_str.ends_with('/') {
+            anyhow::bail!("subdirectory filter must name a normalized relative directory");
+        }
+
+        // Match the exact directory or one of its descendants. Escape SQLite
+        // LIKE wildcards so directories containing `%` or `_` remain literal.
+        let escaped_prefix = prefix_str
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_pattern = format!("{escaped_prefix}/%");
         let subset = filtering::where_condition(
             &self.index_path,
-            "file LIKE ?",
+            "file LIKE ? ESCAPE '\\'",
             &[serde_json::json!(like_pattern)],
         )
-        .unwrap_or_default();
+        .map_err(|error| anyhow::anyhow!("subdirectory metadata filter failed: {error}"))?;
 
         Ok(subset)
     }
 
-    /// Get document IDs matching the given file patterns using globset
+    /// Get document IDs matching the given file patterns using globset.
+    ///
+    /// The SQL side filters a minimal `(id, file)` projection; the trusted
+    /// glob matcher remains on the Rust side. This avoids materializing full
+    /// code metadata for every document in the index.
     pub fn filter_by_file_patterns(&self, patterns: &[String]) -> Result<Vec<i64>> {
         if patterns.is_empty() {
             return Ok(vec![]);
         }
 
-        // Build globset from patterns
-        let Some(glob_set) = build_glob_set(patterns)? else {
+        // Expand and validate before building the matcher, then use one OR'd
+        // regex condition to let SQLite reject obvious non-matches cheaply.
+        let expanded_patterns = prepare_glob_patterns(patterns)?;
+        let Some(glob_set) = build_glob_set(&expanded_patterns)? else {
             return Ok(vec![]);
         };
+        let regex_patterns: Vec<String> =
+            expanded_patterns.iter().map(|p| glob_to_regex(p)).collect();
+        let combined_regex = regex_patterns.join("|");
 
-        // Get all metadata from the index
-        let all_metadata = filtering::get(&self.index_path, None, &[], None).unwrap_or_default();
+        let candidates = filtering::get(
+            &self.index_path,
+            Some("file REGEXP ?"),
+            &[serde_json::json!(combined_regex)],
+            None,
+        )
+        .map_err(|error| anyhow::anyhow!("include metadata filter failed: {error}"))?;
 
-        // Filter metadata by matching file paths against glob patterns
-        let matching_ids: Vec<i64> = all_metadata
+        let matching_ids: Vec<i64> = candidates
             .into_iter()
             .filter_map(|row| {
                 let doc_id = row.get("_subset_")?.as_i64()?;
@@ -4299,7 +4321,7 @@ impl Searcher {
             "NOT (file REGEXP ?)",
             &[serde_json::json!(combined_regex)],
         )
-        .unwrap_or_default();
+        .map_err(|error| anyhow::anyhow!("exclude metadata filter failed: {error}"))?;
 
         Ok(subset)
     }
@@ -4329,7 +4351,7 @@ impl Searcher {
             "NOT (file REGEXP ?)",
             &[serde_json::json!(combined_regex)],
         )
-        .unwrap_or_default();
+        .map_err(|error| anyhow::anyhow!("exclude-directory metadata filter failed: {error}"))?;
 
         Ok(subset)
     }
@@ -4350,8 +4372,8 @@ impl Searcher {
         }
 
         let condition = conditions.join(" OR ");
-        let subset =
-            filtering::where_condition(&self.index_path, &condition, &params).unwrap_or_default();
+        let subset = filtering::where_condition(&self.index_path, &condition, &params)
+            .map_err(|error| anyhow::anyhow!("file metadata filter failed: {error}"))?;
 
         Ok(subset)
     }

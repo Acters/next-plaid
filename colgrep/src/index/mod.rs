@@ -4235,19 +4235,22 @@ impl Searcher {
             anyhow::bail!("subdirectory filter must name a normalized relative directory");
         }
 
-        // Match the exact directory or one of its descendants. Escape SQLite
-        // LIKE wildcards so directories containing `%` or `_` remain literal.
-        let escaped_prefix = prefix_str
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let like_pattern = format!("{escaped_prefix}/%");
-        let subset = filtering::where_condition(
-            &self.index_path,
-            "file LIKE ? ESCAPE '\\'",
-            &[serde_json::json!(like_pattern)],
-        )
-        .map_err(|error| anyhow::anyhow!("subdirectory metadata filter failed: {error}"))?;
+        // Match the exact directory or one of its descendants. Rust-side
+        // comparison avoids SQL LIKE wildcard semantics and keeps directories
+        // containing `%`, `_`, or regex characters literal.
+        let prefix_with_separator = format!("{prefix_str}/");
+        let candidates = filtering::where_condition(&self.index_path, "1=1", &[])
+            .map_err(|error| anyhow::anyhow!("subdirectory metadata filter failed: {error}"))?;
+        let candidate_rows = filtering::get(&self.index_path, None, &[], Some(&candidates))
+            .map_err(|error| anyhow::anyhow!("subdirectory metadata lookup failed: {error}"))?;
+        let subset = candidate_rows
+            .into_iter()
+            .filter_map(|row| {
+                let doc_id = row.get("_subset_")?.as_i64()?;
+                let file = row.get("file")?.as_str()?;
+                (file == prefix_str || file.starts_with(&prefix_with_separator)).then_some(doc_id)
+            })
+            .collect();
 
         Ok(subset)
     }
@@ -4272,15 +4275,16 @@ impl Searcher {
             expanded_patterns.iter().map(|p| glob_to_regex(p)).collect();
         let combined_regex = regex_patterns.join("|");
 
-        let candidates = filtering::get(
+        let candidates = filtering::where_condition_regexp(
             &self.index_path,
-            Some("file REGEXP ?"),
+            "file REGEXP ?",
             &[serde_json::json!(combined_regex)],
-            None,
         )
         .map_err(|error| anyhow::anyhow!("include metadata filter failed: {error}"))?;
 
-        let matching_ids: Vec<i64> = candidates
+        let candidate_rows = filtering::get(&self.index_path, None, &[], Some(&candidates))
+            .map_err(|error| anyhow::anyhow!("include metadata lookup failed: {error}"))?;
+        let matching_ids: Vec<i64> = candidate_rows
             .into_iter()
             .filter_map(|row| {
                 let doc_id = row.get("_subset_")?.as_i64()?;

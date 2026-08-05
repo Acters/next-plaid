@@ -6,7 +6,7 @@
 - Commit: `b2ce382`
 - Base: upstream `1.6.5` (`76092e1`)
 - Binary: `target/release/colgrep`, 68 MiB, SHA-256 `faed5a68e896f1586a46388e651aafc9089f8b0ee610a87c785f6e151ba69a45`
-- Wrapper: `/home/acters/Projects/dreb_extensions/extensions/colgrep/scripts/colgrep-cuda13-wrapper.sh`, SHA-256 `dbf9b25482381e08246cd909cc4a2c081650a1401fff989b22bbeb3a786cbc10`
+- Wrapper: [`dreb-extensions/extensions/colgrep/scripts/colgrep-cuda13-wrapper.sh`](https://github.com/Acters/dreb-extensions/blob/main/extensions/colgrep/scripts/colgrep-cuda13-wrapper.sh), SHA-256 `dbf9b25482381e08246cd909cc4a2c081650a1401fff989b22bbeb3a786cbc10`
 - ONNX Runtime: `onnxruntime-opt-cuda 1.28.0-1`
 - CUDA: `13.3.1-1`
 - cuDNN: `9.24.0.43-1.1`
@@ -28,9 +28,9 @@ Passed after the final runtime commit:
 
 ## Live runtime checks
 
-Target project: `/home/acters/Downloads/dreb`
+Target project: a local dreb checkout
 
-Index: `/home/acters/.local/share/colgrep/indices/dreb-7d6c3f0b`
+Index: `$XDG_DATA_HOME/colgrep/indices/<project-id>`
 
 ### Health/search/shutdown
 

@@ -827,7 +827,7 @@ const DEFAULT_N_FULL_SCORES: usize = 8192;
 ///   minimum centroid max-score to be considered; -1 disables pruning.
 ///   Saturated empirically; left at the next-plaid default.
 ///
-/// All three are search-time only, so they can be tuned on cached indices
+/// All of them are search-time only, so they can be tuned on cached indices
 /// without re-indexing.
 fn search_params_from_env(top_k: usize) -> SearchParameters {
     let defaults = SearchParameters::default();

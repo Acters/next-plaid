@@ -195,6 +195,9 @@ EXAMPLES:
     # Bound CUDA codec working memory for this indexing run (not a VRAM cap)
     colgrep init --codec-gpu-memory-mb 256
 
+    # Keep a dedicated index for this exact root instead of reusing an indexed parent
+    colgrep init --exact-root ~/projects/myapp
+
     # Bound dedicated document-pooling workers for this run (not ONNX/tokenizer/codec threads)
     colgrep init --pooling-threads 4
 
@@ -728,6 +731,10 @@ pub enum Commands {
         )]
         pooling_threads: Option<usize>,
 
+        /// Index this exact project root instead of reusing an enclosing parent index
+        #[arg(long = "exact-root")]
+        exact_root: bool,
+
         /// Use strict batch-size batching instead of fixed dynamic GPU batching
         #[arg(long = "static-batch")]
         static_batch: bool,
@@ -944,6 +951,25 @@ mod tests {
             .err()
             .expect("non-integer should be rejected");
         assert!(error.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn exact_root_cli_is_explicit_and_defaults_off() {
+        let default = Cli::try_parse_from(["colgrep", "init"]).unwrap();
+        let Some(Commands::Init {
+            exact_root: default_exact_root,
+            ..
+        }) = default.command
+        else {
+            panic!("expected init command");
+        };
+        assert!(!default_exact_root);
+
+        let explicit = Cli::try_parse_from(["colgrep", "init", "--exact-root"]).unwrap();
+        let Some(Commands::Init { exact_root, .. }) = explicit.command else {
+            panic!("expected init command");
+        };
+        assert!(exact_root);
     }
 
     #[test]

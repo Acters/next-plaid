@@ -17,6 +17,7 @@ pub struct InitOptions<'a> {
     pub index_chunk_size: Option<usize>,
     pub codec_gpu_memory_mb: Option<u64>,
     pub pooling_threads: Option<usize>,
+    pub exact_root: bool,
     pub static_batch: bool,
 }
 
@@ -79,7 +80,7 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     // project adopt this init; without the guard, `init` on a nested project's
     // root would update the OUTER project instead, and coverage registered
     // under the nested root would never apply.
-    let parent_info = if index_exists(&path, &model) {
+    let parent_info = if options.exact_root || index_exists(&path, &model) {
         None
     } else {
         find_parent_index(&path, &model)?

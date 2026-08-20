@@ -7,8 +7,8 @@ use colored::Colorize;
 use colgrep::{
     acquire_index_lock, acquire_index_read_lock, bre_to_ere, ensure_model, escape_literal_braces,
     find_parent_index, get_index_dir_for_project, index_exists, is_text_format,
-    path_contains_ignored_dir, try_acquire_index_read_lock, Config, IndexBuilder, IndexGeneration,
-    IndexState, Searcher, DEFAULT_MODEL, INDEX_FORMAT_VERSION,
+    path_contains_ignored_dir, resolve_quantized, try_acquire_index_read_lock, Config,
+    IndexBuilder, IndexGeneration, IndexState, Searcher, DEFAULT_MODEL, INDEX_FORMAT_VERSION,
 };
 
 use crate::display::{
@@ -526,7 +526,7 @@ impl SearchEngine {
         let _read_lock = acquire_index_read_lock(&index_dir)
             .context("Failed to acquire shared index lock while loading")?;
         let model_path = ensure_model(Some(&model), true)?;
-        let quantized = !config.use_fp32();
+        let quantized = resolve_quantized(&model_path, !config.use_fp32());
         let searcher =
             Searcher::load_read_only_with_quantized(&project_root, &model, &model_path, quantized)?;
         // IndexBuilder creates the embedding model lazily. This instance is used
@@ -659,17 +659,13 @@ pub(crate) fn checked_index_state(
             "stale-index: the index is being built; restart the server after the build completes"
         );
     }
-    let state = IndexState::load(index_dir).map_err(|error| {
-        anyhow::anyhow!(
-            "stale-index: unable to read index state from {}: {error}",
-            index_dir.display()
-        )
-    })?;
+    let state = IndexState::load(index_dir)
+        .with_context(|| format!("Unable to read index state from {}", index_dir.display()))?;
     let current = state
         .generation_with_index_dir(index_dir)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "stale-index: unable to fingerprint vector metadata in {}: {error}",
+        .with_context(|| {
+            format!(
+                "Unable to fingerprint vector metadata in {}",
                 index_dir.display()
             )
         })?;

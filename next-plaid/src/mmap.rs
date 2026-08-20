@@ -656,8 +656,8 @@ pub fn normalize_u8_npy(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Parse NPY header and return (shape, data_offset, is_fortran_order)
-fn parse_npy_header(path: &Path, mmap: &Mmap) -> Result<(Vec<usize>, usize, bool)> {
+/// Parse an NPY header and return its shape, payload offset, layout, and dtype.
+fn parse_npy_header(path: &Path, mmap: &Mmap) -> Result<(Vec<usize>, usize, bool, String)> {
     if mmap.len() < 10 {
         return Err(Error::IndexLoad(format!(
             "NPY file {:?} too small: {} bytes",
@@ -709,11 +709,36 @@ fn parse_npy_header(path: &Path, mmap: &Mmap) -> Result<(Vec<usize>, usize, bool
     let header_str = std::str::from_utf8(&mmap[header_start..header_end])
         .map_err(|e| Error::IndexLoad(format!("Invalid NPY header encoding: {}", e)))?;
 
-    // Extract shape from header like: {'descr': '<i8', 'fortran_order': False, 'shape': (12345,), }
+    // Extract fields from a primitive-array header like:
+    // {'descr': '<i8', 'fortran_order': False, 'shape': (12345,), }
     let shape = parse_shape_from_header(header_str)?;
-    let fortran_order = header_str.contains("'fortran_order': True");
+    let descr = parse_descr_from_header(header_str)?;
+    let fortran_order = header_str.contains("'fortran_order': True")
+        || header_str.contains("\"fortran_order\": True");
 
-    Ok((shape, header_end, fortran_order))
+    Ok((shape, header_end, fortran_order, descr))
+}
+
+fn parse_descr_from_header(header: &str) -> Result<String> {
+    let value = ["'descr':", "\"descr\":"]
+        .into_iter()
+        .find_map(|marker| {
+            header
+                .find(marker)
+                .map(|offset| &header[offset + marker.len()..])
+        })
+        .ok_or_else(|| Error::IndexLoad("No descr in NPY header".into()))?
+        .trim_start();
+    let quote = value
+        .chars()
+        .next()
+        .filter(|quote| *quote == '\'' || *quote == '"')
+        .ok_or_else(|| Error::IndexLoad("Invalid descr in NPY header".into()))?;
+    let rest = &value[quote.len_utf8()..];
+    let end = rest
+        .find(quote)
+        .ok_or_else(|| Error::IndexLoad("Unclosed descr in NPY header".into()))?;
+    Ok(rest[..end].to_string())
 }
 
 /// Parse shape tuple from NPY header string
@@ -762,10 +787,35 @@ pub struct MmapNpyArray1I64 {
 /// Used for the optional per-token inverse reconstruction norms. The NPY
 /// writer aligns the payload, so slices can borrow the mmap directly without
 /// copying the whole index into the process heap.
+const INV_NORM_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const INV_NORM_HASH_PRIME: u64 = 0x100000001b3;
+
+fn extend_inv_norm_hash(hash: &mut u64, value: f32) -> bool {
+    if !value.is_finite() || value <= 0.0 {
+        return false;
+    }
+    for byte in value.to_bits().to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(INV_NORM_HASH_PRIME);
+    }
+    true
+}
+
+fn inv_norm_hash(values: impl IntoIterator<Item = f32>) -> Option<u64> {
+    let mut hash = INV_NORM_HASH_OFFSET;
+    for value in values {
+        if !extend_inv_norm_hash(&mut hash, value) {
+            return None;
+        }
+    }
+    Some(hash)
+}
+
 pub struct MmapNpyArray1F32 {
     _mmap: Mmap,
     len: usize,
     data_offset: usize,
+    payload_hash: u64,
 }
 
 impl MmapNpyArray1F32 {
@@ -779,6 +829,7 @@ impl MmapNpyArray1F32 {
             _mmap: mmap,
             len: 0,
             data_offset: 0,
+            payload_hash: INV_NORM_HASH_OFFSET,
         }
     }
 
@@ -791,20 +842,36 @@ impl MmapNpyArray1F32 {
                 Error::IndexLoad(format!("Failed to mmap NPY file {:?}: {}", path, e))
             })?
         };
-        let (shape, data_offset, _fortran_order) = parse_npy_header(path, &mmap)?;
+        let (shape, data_offset, _fortran_order, descr) = parse_npy_header(path, &mmap)?;
         if shape.len() != 1 {
             return Err(Error::IndexLoad(format!(
                 "Expected 1D array, got {}D",
                 shape.len()
             )));
         }
-        let len = shape[0];
-        let expected_size = data_offset + len * std::mem::size_of::<f32>();
-        if mmap.len() < expected_size {
+        if !cfg!(target_endian = "little") {
+            return Err(Error::IndexLoad(
+                "zero-copy inverse-norm sidecars require a little-endian target".into(),
+            ));
+        }
+        if !["<f4", "=f4"].contains(&descr.as_str()) {
             return Err(Error::IndexLoad(format!(
-                "NPY file size {} too small for {} f32 elements",
+                "Expected native-endian f32 NPY dtype, got {descr:?}"
+            )));
+        }
+        let len = shape[0];
+        let payload_size = len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::IndexLoad("f32 NPY payload size overflow".into()))?;
+        let expected_size = data_offset
+            .checked_add(payload_size)
+            .ok_or_else(|| Error::IndexLoad("f32 NPY file size overflow".into()))?;
+        if mmap.len() != expected_size {
+            return Err(Error::IndexLoad(format!(
+                "NPY file size {} does not match {} f32 elements (expected {})",
                 mmap.len(),
-                len
+                len,
+                expected_size
             )));
         }
         if data_offset % std::mem::align_of::<f32>() != 0 {
@@ -813,11 +880,17 @@ impl MmapNpyArray1F32 {
                 path, data_offset
             )));
         }
-        Ok(Self {
+        let mut mapped = Self {
             _mmap: mmap,
             len,
             data_offset,
-        })
+            payload_hash: INV_NORM_HASH_OFFSET,
+        };
+        mapped.payload_hash =
+            inv_norm_hash(mapped.slice(0, len).iter().copied()).ok_or_else(|| {
+                Error::IndexLoad("inverse norms must all be finite and greater than zero".into())
+            })?;
+        Ok(mapped)
     }
 
     pub fn len(&self) -> usize {
@@ -826,6 +899,10 @@ impl MmapNpyArray1F32 {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn payload_hash(&self) -> u64 {
+        self.payload_hash
     }
 
     /// Borrow a zero-copy slice of `[start, end)`.
@@ -868,7 +945,7 @@ impl MmapNpyArray1I64 {
             })?
         };
 
-        let (shape, data_offset, _fortran_order) = parse_npy_header(path, &mmap)?;
+        let (shape, data_offset, _fortran_order, _descr) = parse_npy_header(path, &mmap)?;
 
         if shape.is_empty() {
             return Err(Error::IndexLoad("Empty shape in NPY file".into()));
@@ -964,7 +1041,7 @@ impl MmapNpyArray2F32 {
             })?
         };
 
-        let (shape_vec, data_offset, _fortran_order) = parse_npy_header(path, &mmap)?;
+        let (shape_vec, data_offset, _fortran_order, _descr) = parse_npy_header(path, &mmap)?;
 
         if shape_vec.len() != 2 {
             return Err(Error::IndexLoad(format!(
@@ -1095,7 +1172,7 @@ impl MmapNpyArray2U8 {
             })?
         };
 
-        let (shape_vec, data_offset, _fortran_order) = parse_npy_header(path, &mmap)?;
+        let (shape_vec, data_offset, _fortran_order, _descr) = parse_npy_header(path, &mmap)?;
 
         if shape_vec.len() != 2 {
             return Err(Error::IndexLoad(format!(
@@ -1192,6 +1269,10 @@ pub struct MergeManifest {
     /// Number of columns (for 2D arrays like residuals)
     #[serde(default)]
     pub ncols: usize,
+    /// Stable checksum of optional merged inverse norms. Other merged artifact
+    /// types leave this unset.
+    #[serde(default)]
+    pub payload_hash: Option<u64>,
 }
 
 /// Legacy manifest type (for backwards compatibility during migration)
@@ -1220,6 +1301,7 @@ fn load_merge_manifest(manifest_path: &Path) -> Option<MergeManifest> {
                         ncols: 0,
                         num_chunks: 0,
                         metadata_mtime: 0.0,
+                        payload_hash: None,
                     });
                 }
             }
@@ -1674,6 +1756,7 @@ pub fn merge_codes_chunks(
         ncols: 0, // Not used for 1D codes array
         num_chunks,
         metadata_mtime: current_metadata_mtime,
+        payload_hash: None,
     };
     save_merge_manifest(&manifest_path, &new_manifest)?;
 
@@ -1717,7 +1800,12 @@ pub fn merge_inv_norm_chunks(
             if let Ok(meta) = fs::metadata(&merged_path) {
                 let expected_size = aligned_npy_header_size_1d(manifest.total_rows, "<f4")
                     + manifest.total_rows * std::mem::size_of::<f32>();
-                if meta.len() == expected_size as u64 {
+                if meta.len() == expected_size as u64
+                    && MmapNpyArray1F32::from_npy_file(&merged_path).is_ok_and(|inv_norms| {
+                        inv_norms.len() == manifest.total_rows
+                            && manifest.payload_hash == Some(inv_norms.payload_hash())
+                    })
+                {
                     return Ok(Some(merged_path));
                 }
             }
@@ -1729,6 +1817,7 @@ pub fn merge_inv_norm_chunks(
     let mut chunks = Vec::with_capacity(num_chunks);
     let mut total_rows = 0usize;
     let mut chain_broken = false;
+    let mut expected_payload_hash = INV_NORM_HASH_OFFSET;
 
     for i in 0..num_chunks {
         let filename = format!("{}.inv_norms.npy", i);
@@ -1736,6 +1825,20 @@ pub fn merge_inv_norm_chunks(
         let mtime = get_mtime(&path)?;
         let arr: Array1<f32> = Array1::read_npy(File::open(&path)?)?;
         let rows = arr.len();
+        let codes_rows =
+            MmapNpyArray1I64::from_npy_file(&index_path.join(format!("{}.codes.npy", i)))?.len();
+        if rows != codes_rows {
+            return Err(Error::IndexLoad(format!(
+                "inverse norm chunk {i} has {rows} rows but codes chunk has {codes_rows}"
+            )));
+        }
+        for &value in &arr {
+            if !extend_inv_norm_hash(&mut expected_payload_hash, value) {
+                return Err(Error::IndexLoad(format!(
+                    "inverse norm chunk {i} contains a non-finite or non-positive value"
+                )));
+            }
+        }
         total_rows += rows;
         let is_clean = old_manifest.as_ref().is_some_and(|manifest| {
             manifest
@@ -1757,8 +1860,15 @@ pub fn merge_inv_norm_chunks(
     if total_rows == 0 {
         return Err(Error::IndexLoad("No inverse norm data to merge".into()));
     }
+    for _ in 0..padding_rows {
+        extend_inv_norm_hash(&mut expected_payload_hash, 1.0);
+    }
     let final_rows = total_rows + padding_rows;
-    let needs_full_rewrite = !merged_path.exists()
+    let merged_payload_is_valid =
+        MmapNpyArray1F32::from_npy_file(&merged_path).is_ok_and(|inv_norms| {
+            inv_norms.len() == final_rows && inv_norms.payload_hash() == expected_payload_hash
+        });
+    let needs_full_rewrite = !merged_payload_is_valid
         || chain_broken
         || old_manifest
             .as_ref()
@@ -1829,6 +1939,7 @@ pub fn merge_inv_norm_chunks(
             metadata_mtime: current_metadata_mtime,
             total_rows: final_rows,
             ncols: 0,
+            payload_hash: Some(expected_payload_hash),
         },
     )?;
 
@@ -2041,6 +2152,7 @@ pub fn merge_residuals_chunks(
         ncols,
         num_chunks,
         metadata_mtime: current_metadata_mtime,
+        payload_hash: None,
     };
     save_merge_manifest(&manifest_path, &new_manifest)?;
 
@@ -2264,6 +2376,47 @@ mod tests {
         let loaded = mmap.to_owned();
 
         assert_eq!(array, loaded);
+    }
+
+    #[test]
+    fn mmap_inverse_norms_require_exact_native_f32_payload() {
+        let mut valid = NamedTempFile::new().unwrap();
+        Array1::from_vec(vec![1.0f32, 0.5, 0.25])
+            .write_npy(&mut valid)
+            .unwrap();
+        valid.flush().unwrap();
+        let mapped = MmapNpyArray1F32::from_npy_file(valid.path()).unwrap();
+        assert_eq!(mapped.slice(0, 3), &[1.0, 0.5, 0.25]);
+
+        let mut wrong_dtype = NamedTempFile::new().unwrap();
+        Array1::from_vec(vec![1.0f64, 0.5, 0.25])
+            .write_npy(&mut wrong_dtype)
+            .unwrap();
+        wrong_dtype.flush().unwrap();
+        let error = match MmapNpyArray1F32::from_npy_file(wrong_dtype.path()) {
+            Ok(_) => panic!("wrong dtype was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("f32 NPY dtype"));
+
+        valid.write_all(&[0, 0, 0, 0]).unwrap();
+        valid.flush().unwrap();
+        let error = match MmapNpyArray1F32::from_npy_file(valid.path()) {
+            Ok(_) => panic!("trailing payload was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not match"));
+
+        let mut invalid_values = NamedTempFile::new().unwrap();
+        Array1::from_vec(vec![1.0f32, 0.0, f32::NAN])
+            .write_npy(&mut invalid_values)
+            .unwrap();
+        invalid_values.flush().unwrap();
+        let error = match MmapNpyArray1F32::from_npy_file(invalid_values.path()) {
+            Ok(_) => panic!("invalid inverse norms were accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[test]

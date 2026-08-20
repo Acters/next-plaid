@@ -1256,11 +1256,15 @@ fn load_merged_inv_norms_read_only(
         return None;
     }
 
-    // Mapping validates the NPY header and rejects files too small for their
-    // declared shape; the row-count cross-checks tie the sidecar to both its
-    // manifest and the validated merged codes.
+    // Mapping validates dtype, exact size, and values. The row count and stable
+    // payload checksum tie the optional sidecar to its manifest and the
+    // already-validated merged codes. Old checksum-less manifests safely use
+    // the on-demand compatibility path until a normal load upgrades them.
     let inv_norms = crate::mmap::MmapNpyArray1F32::from_npy_file(&merged_path).ok()?;
-    if inv_norms.len() != manifest.total_rows || inv_norms.len() != expected_rows {
+    if inv_norms.len() != manifest.total_rows
+        || inv_norms.len() != expected_rows
+        || manifest.payload_hash != Some(inv_norms.payload_hash())
+    {
         return None;
     }
     Some(inv_norms)
@@ -1584,7 +1588,19 @@ impl MmapIndex {
             let merged_inv_norms_path = if metadata.binary {
                 None
             } else {
-                crate::mmap::merge_inv_norm_chunks(index_dir, metadata.num_chunks, padding_needed)?
+                match crate::mmap::merge_inv_norm_chunks(
+                    index_dir,
+                    metadata.num_chunks,
+                    padding_needed,
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        eprintln!(
+                            "⚠️  Ignoring invalid optional inverse-norm sidecar; it will be regenerated: {error}"
+                        );
+                        None
+                    }
+                }
             };
 
             let mmap_codes = crate::mmap::MmapNpyArray1I64::from_npy_file(&merged_codes_path)?;
@@ -1666,6 +1682,9 @@ impl MmapIndex {
     /// Returns `true` when a legacy index was upgraded, and `false` for binary
     /// indexes or indexes whose sidecar is already mapped.
     pub fn prewarm_residual_lut_sidecar(&mut self) -> Result<bool> {
+        if cfg!(target_endian = "big") {
+            return Ok(false);
+        }
         if self.metadata.binary || self.mmap_inv_norms.is_some() {
             return Ok(false);
         }
@@ -1684,12 +1703,9 @@ impl MmapIndex {
                 )));
             }
             let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
-            let sidecar_is_current = if inv_norms_path.exists() {
-                crate::mmap::MmapNpyArray1F32::from_npy_file(&inv_norms_path)?.len()
-                    == chunk_metadata.num_embeddings
-            } else {
-                false
-            };
+            let sidecar_is_current = inv_norms_path.exists()
+                && crate::mmap::MmapNpyArray1F32::from_npy_file(&inv_norms_path)
+                    .is_ok_and(|inv_norms| inv_norms.len() == chunk_metadata.num_embeddings);
 
             if !sidecar_is_current {
                 write_inv_norms_chunk_from_mmap(

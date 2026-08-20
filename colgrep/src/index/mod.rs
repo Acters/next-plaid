@@ -3065,10 +3065,10 @@ impl IndexBuilder {
 /// rebuilds alike — including the rebuilds an index-format bump or a
 /// `colgrep clear` forces.
 ///
-/// Walker errors are skipped during normal indexing, but with
-/// `fail_on_walk_error` (freshness checks) they are propagated so staleness
-/// detection fails closed instead of reporting a partially-walked tree as
-/// fresh. Both modes share identical ignore/force-include semantics.
+/// Walker errors are always propagated so neither indexing nor freshness
+/// detection can accept a partially walked tree as complete. The mode only
+/// selects operation-specific error context. Both modes share identical
+/// ignore/force-include semantics.
 fn scan_project_files(
     project_root: &Path,
     languages: Option<&[Language]>,
@@ -3109,8 +3109,18 @@ fn scan_project_files(
 
     for covered in force_include_dirs {
         let sub_root = project_root.join(covered);
-        if !sub_root.is_dir() {
-            continue;
+        match std::fs::metadata(&sub_root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect force-included directory {}",
+                        sub_root.display()
+                    )
+                });
+            }
         }
         let root = sub_root.clone();
         let extra = extra_ignore.to_vec();
@@ -3143,8 +3153,8 @@ fn scan_project_files(
 /// to `project_root` (which for covered-subtree walks is an ancestor of the
 /// walker's own root).
 ///
-/// Normal indexing skips entries the walker fails to read; freshness checks
-/// (`fail_on_walk_error`) propagate the first error instead.
+/// Both indexing and freshness checks propagate the first walker error. The
+/// mode is retained to attach operation-specific context to that failure.
 fn collect_scanned_files(
     project_root: &Path,
     walker: ignore::Walk,
@@ -3154,13 +3164,13 @@ fn collect_scanned_files(
     fail_on_walk_error: bool,
 ) -> Result<()> {
     for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if fail_on_walk_error => {
-                return Err(error).context("Failed to walk project tree while checking freshness");
+        let entry = entry.with_context(|| {
+            if fail_on_walk_error {
+                "Failed to walk project tree while checking freshness"
+            } else {
+                "Failed to walk project tree while indexing"
             }
-            Err(_) => continue,
-        };
+        })?;
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
@@ -4321,6 +4331,11 @@ fn matches_glob_pattern(path: &Path, patterns: &[String]) -> bool {
     glob_set.is_match(path)
 }
 
+fn path_is_within_literal_prefix(file: &str, prefix: &str) -> bool {
+    let prefix_with_separator = format!("{prefix}{}", std::path::MAIN_SEPARATOR);
+    file == prefix || file.starts_with(&prefix_with_separator)
+}
+
 pub struct Searcher {
     model: Colbert,
     index: MmapIndex,
@@ -4499,8 +4514,6 @@ impl Searcher {
         // component boundary must too. Rust-side comparison avoids SQL LIKE
         // wildcard semantics and keeps directories containing `%`, `_`, or regex
         // characters literal.
-        let sep = std::path::MAIN_SEPARATOR;
-        let prefix_with_separator = format!("{prefix_str}{sep}");
         let candidates = filtering::where_condition(&self.index_path, "1=1", &[])
             .map_err(|error| anyhow::anyhow!("subdirectory metadata filter failed: {error}"))?;
         let candidate_rows = filtering::get(&self.index_path, None, &[], Some(&candidates))
@@ -4510,7 +4523,7 @@ impl Searcher {
             .filter_map(|row| {
                 let doc_id = row.get("_subset_")?.as_i64()?;
                 let file = row.get("file")?.as_str()?;
-                (file == prefix_str || file.starts_with(&prefix_with_separator)).then_some(doc_id)
+                path_is_within_literal_prefix(file, &prefix_str).then_some(doc_id)
             })
             .collect();
 
@@ -5600,6 +5613,23 @@ mod tests {
         assert!(error.to_string().contains("Failed to walk project tree"));
     }
 
+    #[test]
+    fn test_normal_index_scan_fails_closed_when_project_walk_fails() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        let index = tempfile::tempdir().unwrap();
+        let builder = test_builder(&project_path, index.path());
+        drop(project);
+
+        let error = builder.scan_files(None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to walk project tree while indexing"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     /// Measures what the mtime fast path saves on the per-search update plan:
     /// the same synthetic tree planned once with matching stored mtimes
     /// (stat-only fast path) and once with mismatched mtimes but identical
@@ -5866,6 +5896,27 @@ mod tests {
             &patterns
         ));
         assert!(!matches_glob_pattern(Path::new("src/main.js"), &patterns));
+    }
+
+    #[test]
+    fn path_prefix_filter_is_literal_and_component_bounded() {
+        let separator = std::path::MAIN_SEPARATOR;
+        assert!(path_is_within_literal_prefix("src", "src"));
+        assert!(path_is_within_literal_prefix(
+            &format!("src{separator}nested{separator}main.rs"),
+            "src"
+        ));
+        assert!(!path_is_within_literal_prefix("src-extra/main.rs", "src"));
+
+        let literal = "%_[]";
+        assert!(path_is_within_literal_prefix(
+            &format!("{literal}{separator}main.rs"),
+            literal
+        ));
+        assert!(!path_is_within_literal_prefix(
+            &format!("%x[]{separator}main.rs"),
+            literal
+        ));
     }
 
     #[test]

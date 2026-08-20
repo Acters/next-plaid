@@ -10,6 +10,7 @@ use ndarray_rand::rand::SeedableRng;
 use ndarray_rand::rand_distr::StandardNormal;
 use ndarray_rand::RandomExt;
 use next_plaid::index::MmapIndex;
+use next_plaid::search::{SearchParameters, SearchResult};
 use next_plaid::IndexConfig;
 use rand::rngs::StdRng;
 use serde_json::json;
@@ -68,6 +69,37 @@ fn prepared_index_with_batch(batch_size: usize) -> TempDir {
     dir
 }
 
+fn fixed_query() -> Array2<f32> {
+    let mut rng = StdRng::seed_from_u64(99);
+    Array2::random_using((4, 8), StandardNormal, &mut rng)
+}
+
+fn search(index: &MmapIndex, query: &Array2<f32>) -> SearchResult {
+    index
+        .search(
+            query,
+            &SearchParameters {
+                n_full_scores: 12,
+                top_k: 10,
+                n_ivf_probe: 8,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+}
+
+fn assert_search_equivalent(expected: &SearchResult, actual: &SearchResult) {
+    assert_eq!(actual.passage_ids, expected.passage_ids);
+    assert_eq!(actual.scores.len(), expected.scores.len());
+    for (actual, expected) in actual.scores.iter().zip(&expected.scores) {
+        assert!(
+            (actual - expected).abs() <= 1e-5,
+            "score mismatch: {actual} != {expected}"
+        );
+    }
+}
+
 fn assert_read_only_failure_without_writes(dir: &TempDir) {
     let before = snapshot_files(dir.path());
     let error = match MmapIndex::load_read_only(dir.path().to_str().unwrap()) {
@@ -102,12 +134,18 @@ fn prepared_index_loads_read_only_without_changing_files() {
 #[test]
 fn missing_inverse_norm_sidecar_falls_back_without_writes() {
     let dir = prepared_index();
+    let query = fixed_query();
+    let expected = search(
+        &MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap(),
+        &query,
+    );
     fs::remove_file(dir.path().join("merged_inv_norms.npy")).unwrap();
     fs::remove_file(dir.path().join("merged_inv_norms.manifest.json")).unwrap();
     let before = snapshot_files(dir.path());
 
     let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
     assert_eq!(index.num_documents(), 12);
+    assert_search_equivalent(&expected, &search(&index, &query));
     drop(index);
 
     assert_eq!(before, snapshot_files(dir.path()));
@@ -116,6 +154,11 @@ fn missing_inverse_norm_sidecar_falls_back_without_writes() {
 #[test]
 fn stale_inverse_norm_manifest_falls_back_without_writes() {
     let dir = prepared_index();
+    let query = fixed_query();
+    let expected = search(
+        &MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap(),
+        &query,
+    );
     let manifest_path = dir.path().join("merged_inv_norms.manifest.json");
     let mut manifest: serde_json::Value =
         serde_json::from_reader(fs::File::open(&manifest_path).unwrap()).unwrap();
@@ -125,9 +168,88 @@ fn stale_inverse_norm_manifest_falls_back_without_writes() {
 
     let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
     assert_eq!(index.num_embeddings(), 36);
+    assert_search_equivalent(&expected, &search(&index, &query));
     drop(index);
 
     assert_eq!(before, snapshot_files(dir.path()));
+}
+
+#[test]
+fn wrong_inverse_norm_dtype_falls_back_without_writes() {
+    use ndarray::Array1;
+    use ndarray_npy::WriteNpyExt;
+
+    let dir = prepared_index();
+    let query = fixed_query();
+    let expected = search(
+        &MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap(),
+        &query,
+    );
+    let manifest: serde_json::Value = serde_json::from_reader(
+        fs::File::open(dir.path().join("merged_inv_norms.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let rows = manifest["total_rows"].as_u64().unwrap() as usize;
+    let mut file = fs::File::create(dir.path().join("merged_inv_norms.npy")).unwrap();
+    Array1::from_elem(rows, 1.0f64)
+        .write_npy(&mut file)
+        .unwrap();
+    let before = snapshot_files(dir.path());
+
+    let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
+    assert_search_equivalent(&expected, &search(&index, &query));
+    drop(index);
+
+    assert_eq!(before, snapshot_files(dir.path()));
+}
+
+#[test]
+fn inverse_norm_checksum_mismatch_falls_back_without_writes() {
+    use ndarray::Array1;
+    use ndarray_npy::{ReadNpyExt, WriteNpyExt};
+
+    let dir = prepared_index();
+    let query = fixed_query();
+    let expected = search(
+        &MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap(),
+        &query,
+    );
+    let merged_path = dir.path().join("merged_inv_norms.npy");
+    let mut values: Array1<f32> = Array1::read_npy(fs::File::open(&merged_path).unwrap()).unwrap();
+    values[0] *= 1.01;
+    let mut file = fs::File::create(&merged_path).unwrap();
+    values.write_npy(&mut file).unwrap();
+    let before = snapshot_files(dir.path());
+
+    let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
+    assert_search_equivalent(&expected, &search(&index, &query));
+    drop(index);
+
+    assert_eq!(before, snapshot_files(dir.path()));
+}
+
+#[test]
+fn normal_load_regenerates_a_wrong_sized_optional_inverse_norm_chunk() {
+    use ndarray::Array1;
+    use ndarray_npy::WriteNpyExt;
+
+    let dir = prepared_index();
+    let query = fixed_query();
+    let expected = search(
+        &MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap(),
+        &query,
+    );
+    let mut chunk = fs::File::create(dir.path().join("0.inv_norms.npy")).unwrap();
+    Array1::from_elem(1, 1.0f32).write_npy(&mut chunk).unwrap();
+    fs::remove_file(dir.path().join("merged_inv_norms.npy")).unwrap();
+    fs::remove_file(dir.path().join("merged_inv_norms.manifest.json")).unwrap();
+
+    let index = MmapIndex::load(dir.path().to_str().unwrap()).unwrap();
+    assert_search_equivalent(&expected, &search(&index, &query));
+    use ndarray_npy::ReadNpyExt;
+    let repaired: Array1<f32> =
+        Array1::read_npy(fs::File::open(dir.path().join("0.inv_norms.npy")).unwrap()).unwrap();
+    assert_eq!(repaired.len(), 36);
 }
 
 #[test]

@@ -23,6 +23,10 @@ pub struct InitOptions<'a> {
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
+fn should_reuse_enclosing_index(exact_root: bool, local_index_exists: bool) -> bool {
+    !exact_root && !local_index_exists
+}
+
 fn codec_gpu_memory_budget_bytes(codec_gpu_memory_mb: Option<u64>) -> Result<Option<usize>> {
     let Some(mib) = codec_gpu_memory_mb else {
         return Ok(None);
@@ -80,11 +84,12 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     // project adopt this init; without the guard, `init` on a nested project's
     // root would update the OUTER project instead, and coverage registered
     // under the nested root would never apply.
-    let parent_info = if options.exact_root || index_exists(&path, &model) {
-        None
-    } else {
-        find_parent_index(&path, &model)?
-    };
+    let parent_info =
+        if should_reuse_enclosing_index(options.exact_root, index_exists(&path, &model)) {
+            find_parent_index(&path, &model)?
+        } else {
+            None
+        };
     // If the adopting project's walk rules exclude `path` — most often a
     // .gitignore entry: dataset corpora, build outputs — updating the parent
     // would report success having indexed none of the requested files. Running
@@ -193,6 +198,14 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn exact_root_never_reuses_an_enclosing_index() {
+        assert!(!should_reuse_enclosing_index(true, false));
+        assert!(!should_reuse_enclosing_index(true, true));
+        assert!(!should_reuse_enclosing_index(false, true));
+        assert!(should_reuse_enclosing_index(false, false));
+    }
 
     #[test]
     fn test_resolve_index_runtime_overrides_preserves_explicit_values() {

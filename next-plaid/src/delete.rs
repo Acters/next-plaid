@@ -7,7 +7,7 @@
 //! - Metadata synchronization
 
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
@@ -166,20 +166,41 @@ fn delete_from_index_impl(doc_ids: &[i64], index_path: &str, clean_buffer: bool)
             // residual indexes. Legacy and binary indexes simply have no file.
             let inv_norms_path = index_dir.join(format!("{}.inv_norms.npy", chunk_idx));
             if inv_norms_path.exists() {
-                let inv_norms: Array1<f32> = Array1::read_npy(File::open(&inv_norms_path)?)?;
-                if inv_norms.len() != embs_to_keep_mask.len() {
-                    return Err(Error::Delete(format!(
-                        "inverse norm rows {} do not match chunk token rows {}",
-                        inv_norms.len(),
-                        embs_to_keep_mask.len()
-                    )));
+                let inv_norms = File::open(&inv_norms_path)
+                    .map_err(Error::Io)
+                    .and_then(|file| Array1::<f32>::read_npy(file).map_err(Error::NpyRead));
+                match inv_norms {
+                    Ok(inv_norms) if inv_norms.len() == embs_to_keep_mask.len() => {
+                        let new_inv_norms: Array1<f32> = inv_norms
+                            .iter()
+                            .zip(embs_to_keep_mask.iter())
+                            .filter_map(|(&norm, &keep)| keep.then_some(norm))
+                            .collect();
+                        if let Err(error) =
+                            crate::utils::atomic_write_file(&inv_norms_path, |file| {
+                                new_inv_norms.write_npy(file)?;
+                                Ok(())
+                            })
+                        {
+                            eprintln!(
+                                "⚠️  Dropping inverse-norm sidecar after rewrite failed: {error}"
+                            );
+                            let _ = fs::remove_file(&inv_norms_path);
+                        }
+                    }
+                    Ok(inv_norms) => {
+                        eprintln!(
+                            "⚠️  Dropping stale inverse-norm sidecar with {} rows; expected {}",
+                            inv_norms.len(),
+                            embs_to_keep_mask.len()
+                        );
+                        let _ = fs::remove_file(&inv_norms_path);
+                    }
+                    Err(error) => {
+                        eprintln!("⚠️  Dropping unreadable optional inverse-norm sidecar: {error}");
+                        let _ = fs::remove_file(&inv_norms_path);
+                    }
                 }
-                let new_inv_norms: Array1<f32> = inv_norms
-                    .iter()
-                    .zip(embs_to_keep_mask.iter())
-                    .filter_map(|(&norm, &keep)| keep.then_some(norm))
-                    .collect();
-                new_inv_norms.write_npy(File::create(&inv_norms_path)?)?;
             }
 
             // Update chunk metadata

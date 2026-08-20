@@ -1091,6 +1091,37 @@ mod tests {
     }
 
     #[test]
+    fn metadata_io_failures_are_not_misclassified_as_stale_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut state = IndexState {
+            index_format_version: INDEX_FORMAT_VERSION,
+            ..Default::default()
+        };
+        state.files.insert(
+            PathBuf::from("src/main.rs"),
+            FileInfo {
+                content_hash: 1,
+                mtime: 2,
+                size: 3,
+            },
+        );
+        state.save(temp_dir.path()).unwrap();
+        let vector_dir = temp_dir.path().join("index");
+        std::fs::create_dir_all(&vector_dir).unwrap();
+        std::fs::write(vector_dir.join("metadata.json"), r#"{"documents":1}"#).unwrap();
+        let expected = validate_server_index_state(temp_dir.path()).unwrap();
+
+        std::fs::write(temp_dir.path().join("state.json"), b"not json").unwrap();
+        let state_error = checked_index_state(temp_dir.path(), expected).unwrap_err();
+        assert!(!format!("{state_error:#}").contains("stale-index:"));
+
+        state.save(temp_dir.path()).unwrap();
+        std::fs::remove_file(vector_dir.join("metadata.json")).unwrap();
+        let metadata_error = checked_index_state(temp_dir.path(), expected).unwrap_err();
+        assert!(!format!("{metadata_error:#}").contains("stale-index:"));
+    }
+
+    #[test]
     fn vector_metadata_rewrite_stales_generation_without_state_change() {
         let temp_dir = TempDir::new().unwrap();
         let mut state = IndexState {

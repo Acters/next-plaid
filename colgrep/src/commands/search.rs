@@ -493,6 +493,7 @@ pub fn resolve_pool_factor(
 pub(crate) struct SearchEngine {
     config: Config,
     searcher: Searcher,
+    freshness_builder: IndexBuilder,
     project_root: PathBuf,
     index_dir: PathBuf,
     model: String,
@@ -525,17 +526,21 @@ impl SearchEngine {
         let _read_lock = acquire_index_read_lock(&index_dir)
             .context("Failed to acquire shared index lock while loading")?;
         let model_path = ensure_model(Some(&model), true)?;
-        let searcher = Searcher::load_read_only_with_quantized(
-            &project_root,
-            &model,
-            &model_path,
-            !config.use_fp32(),
-        )?;
+        let quantized = !config.use_fp32();
+        let searcher =
+            Searcher::load_read_only_with_quantized(&project_root, &model, &model_path, quantized)?;
+        // IndexBuilder creates the embedding model lazily. This instance is used
+        // only for the incremental update planner, so clean searches pay a tree
+        // walk plus the existing mtime/size fast path without loading another
+        // ONNX session.
+        let freshness_builder =
+            IndexBuilder::with_quantized(&project_root, &model, &model_path, quantized)?;
         let generation = validate_server_index_state(&index_dir)?;
 
         Ok(Self {
             config,
             searcher,
+            freshness_builder,
             project_root,
             index_dir,
             model,
@@ -562,7 +567,14 @@ impl SearchEngine {
 
         // Keep the read guard alive across both checks. A writer cannot publish
         // a new vector index between generation validation and the search.
-        check_index_generation(&self.index_dir, self.generation)?;
+        let state = checked_index_state(&self.index_dir, self.generation)?;
+        if self
+            .freshness_builder
+            .source_needs_update(&state, None)
+            .context("Failed to compare project files with the loaded index")?
+        {
+            anyhow::bail!("stale-source: project files changed after the loaded index was built");
+        }
         let options = SearchOptions {
             config: &self.config,
             query,
@@ -638,7 +650,10 @@ pub(crate) fn validate_server_index_state(index_dir: &Path) -> Result<IndexGener
 /// Search-count-only writes do not change `IndexGeneration`, but indexing
 /// mutations or vector-index publication do, so the server reports a stale
 /// index instead of searching a `Searcher` that may no longer match the store.
-pub(crate) fn check_index_generation(index_dir: &Path, expected: IndexGeneration) -> Result<()> {
+pub(crate) fn checked_index_state(
+    index_dir: &Path,
+    expected: IndexGeneration,
+) -> Result<IndexState> {
     if index_dir.join(".building").exists() {
         anyhow::bail!(
             "stale-index: the index is being built; restart the server after the build completes"
@@ -663,7 +678,7 @@ pub(crate) fn check_index_generation(index_dir: &Path, expected: IndexGeneration
             "stale-index: the index changed after the server loaded it; restart the server"
         );
     }
-    Ok(())
+    Ok(state)
 }
 
 #[allow(clippy::too_many_arguments)]

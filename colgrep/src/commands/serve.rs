@@ -453,6 +453,8 @@ fn handle_request<S: SearchService>(service: &S, request: Request) -> Value {
                     "index_busy"
                 } else if message.starts_with("stale-index:") {
                     "stale_index"
+                } else if message.starts_with("stale-source:") {
+                    "stale_source"
                 } else {
                     "search_failed"
                 };
@@ -585,7 +587,7 @@ mod tests {
     use colgrep::{IndexState, INDEX_FORMAT_VERSION};
     use tempfile::TempDir;
 
-    use super::super::search::{check_index_generation, validate_server_index_state};
+    use super::super::search::{checked_index_state, validate_server_index_state};
 
     #[derive(Debug, PartialEq, Eq)]
     struct SearchCall {
@@ -603,6 +605,7 @@ mod tests {
         backend_error: bool,
         busy_error: bool,
         stale_error: bool,
+        stale_source_error: bool,
         serialization_error: bool,
         large_result: bool,
         default_top_k: usize,
@@ -615,6 +618,7 @@ mod tests {
                 backend_error: false,
                 busy_error: false,
                 stale_error: false,
+                stale_source_error: false,
                 serialization_error: false,
                 large_result: false,
                 default_top_k: 15,
@@ -653,6 +657,11 @@ mod tests {
             if self.stale_error {
                 return Err(anyhow::anyhow!(
                     "stale-index: the index changed after the server loaded it"
+                ));
+            }
+            if self.stale_source_error {
+                return Err(anyhow::anyhow!(
+                    "stale-source: project files changed after indexing"
                 ));
             }
             if self.serialization_error || self.large_result {
@@ -953,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_busy_errors_have_distinct_protocol_codes() {
+    fn stale_source_index_and_busy_errors_have_distinct_protocol_codes() {
         let stale_service = MockService {
             stale_error: true,
             ..Default::default()
@@ -967,6 +976,20 @@ mod tests {
         assert_eq!(stale[0]["id"], "stale");
         assert_eq!(stale[0]["op"], "search");
         assert_eq!(stale[0]["error"]["code"], "stale_index");
+
+        let stale_source_service = MockService {
+            stale_source_error: true,
+            ..Default::default()
+        };
+        let stale_source = run(
+            "{\"version\":1,\"id\":\"source\",\"op\":\"search\",\"query\":\"x\"}\n\
+             {\"version\":1,\"id\":\"stop\",\"op\":\"shutdown\"}\n",
+            &stale_source_service,
+        );
+        assert_eq!(stale_source[0]["version"], 1);
+        assert_eq!(stale_source[0]["id"], "source");
+        assert_eq!(stale_source[0]["op"], "search");
+        assert_eq!(stale_source[0]["error"]["code"], "stale_source");
 
         let busy_service = MockService {
             busy_error: true,
@@ -1054,7 +1077,7 @@ mod tests {
         let mut count_only = IndexState::load(temp_dir.path()).unwrap();
         count_only.search_count = 1;
         count_only.save(temp_dir.path()).unwrap();
-        check_index_generation(temp_dir.path(), expected).unwrap();
+        checked_index_state(temp_dir.path(), expected).unwrap();
 
         let mut changed = IndexState::load(temp_dir.path()).unwrap();
         changed
@@ -1063,7 +1086,7 @@ mod tests {
             .unwrap()
             .size = 4;
         changed.save(temp_dir.path()).unwrap();
-        let error = check_index_generation(temp_dir.path(), expected).unwrap_err();
+        let error = checked_index_state(temp_dir.path(), expected).unwrap_err();
         assert!(error.to_string().contains("stale-index"));
     }
 
@@ -1095,7 +1118,7 @@ mod tests {
         // Same state.json and same-length metadata rewrite: only the vector
         // publication fingerprint changes.
         std::fs::write(&metadata_path, r#"{"documents":2}"#).unwrap();
-        let error = check_index_generation(temp_dir.path(), expected).unwrap_err();
+        let error = checked_index_state(temp_dir.path(), expected).unwrap_err();
         assert!(error.to_string().starts_with("stale-index:"));
     }
 

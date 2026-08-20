@@ -27,7 +27,7 @@ Each stdin line is one UTF-8 JSON request. Each stdout line is one JSON response
 - EOF or a successful `shutdown` request exits cleanly.
 - Invalid requests receive an error response; they do not terminate the server.
 
-The server acquires a shared index lock for each search. An index writer cannot replace mmap or SQLite files during a request. If a writer is already active, the response uses `index_busy`. If the index changed between requests, the response uses `stale_index`; restart the server to load the new generation.
+The server acquires a shared index lock for each search. An index writer cannot replace mmap or SQLite files during a request. If a writer is already active, the response uses `index_busy`. If the persisted index changed between requests, the response uses `stale_index`; restart the server to load the new generation. Before searching, the server also runs the incremental planner's project-tree scan with its mtime/size fast path. Added, edited, or deleted indexable files produce `stale_source`; stop the server, run `colgrep init`, and start a fresh server rather than returning results from the stale source snapshot.
 
 ## Requests
 
@@ -96,10 +96,10 @@ Important codes include:
 - `invalid_json`, `unsupported_version`, `missing_id`, `invalid_id`
 - `missing_operation`, `unsupported_operation`, `missing_query`, `empty_query`
 - `top_k_too_large`, `invalid_glob`, `glob_too_large`, `invalid_restriction`
-- `index_busy`, `stale_index`, `search_failed`
+- `index_busy`, `stale_index`, `stale_source`, `search_failed`
 - `response_too_large`, `serialization_error`
 
-Clients should restart the process on `stale_index`, broken pipes, malformed responses, or unexpected process exit. For `index_busy`, retry after the writer completes or restart after the indexing operation.
+Clients should restart the process on `stale_index`, broken pipes, malformed responses, or unexpected process exit. On `stale_source`, restarting alone is insufficient: terminate the process, incrementally update with `colgrep init`, and then restart. For `index_busy`, retry after the writer completes or restart after the indexing operation.
 
 ## Index updates
 

@@ -2882,12 +2882,12 @@ impl IndexBuilder {
             state.files.remove(&path);
         }
 
-        // 2. Index new/changed files (skip previously ignored files)
+        // 2. Index new/changed files. Update planning only re-adds a
+        // previously ignored path after it has become readable/hashable again.
         let files_to_index: Vec<PathBuf> = plan
             .added
             .iter()
             .chain(plan.changed.iter())
-            .filter(|p| !state.ignored_files.contains(*p))
             .cloned()
             .collect();
 
@@ -2920,6 +2920,7 @@ impl IndexBuilder {
             }
 
             new_units.extend(parsed.units);
+            state.ignored_files.remove(&parsed.path);
             if let Some(file_info) = parsed.file_info {
                 state.files.insert(parsed.path, file_info);
             }
@@ -2944,7 +2945,8 @@ impl IndexBuilder {
             .filter(|p| plan.changed.contains(p))
             .cloned()
             .collect();
-        let _ = delete_files_from_index_no_fts_rebuild(index_path, &stale_skipped);
+        delete_files_from_index_no_fts_rebuild(index_path, &stale_skipped)
+            .context("Failed to remove stale index entries for skipped files")?;
 
         // 3. Add new units to index
         let mut was_interrupted = false;
@@ -3023,6 +3025,18 @@ impl IndexBuilder {
     }
 
     fn scan_files(&self, languages: Option<&[Language]>) -> Result<(Vec<PathBuf>, usize)> {
+        self.scan_files_impl(languages, false)
+    }
+
+    fn scan_files_strict(&self, languages: Option<&[Language]>) -> Result<(Vec<PathBuf>, usize)> {
+        self.scan_files_impl(languages, true)
+    }
+
+    fn scan_files_impl(
+        &self,
+        languages: Option<&[Language]>,
+        fail_on_walk_error: bool,
+    ) -> Result<(Vec<PathBuf>, usize)> {
         // Load user-configured ignore/include overrides from persistent config
         let config = crate::config::Config::load().unwrap_or_default();
         let extra_ignore = config.extra_ignore.clone();
@@ -3048,7 +3062,15 @@ impl IndexBuilder {
         let mut files = Vec::new();
         let mut skipped = 0;
 
-        for entry in walker.filter_map(|e| e.ok()) {
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if fail_on_walk_error => {
+                    return Err(error)
+                        .context("Failed to walk project tree while checking freshness");
+                }
+                Err(_) => continue,
+            };
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
@@ -3281,22 +3303,61 @@ fn should_ignore(path: &Path, extra_ignore: &[String], force_include: &[String])
 }
 
 impl IndexBuilder {
+    /// Check whether the project tree contains added, changed, or deleted files
+    /// relative to a persisted index state without loading the embedding model.
+    ///
+    /// The same walker and mtime/size fast path used by incremental indexing are
+    /// reused here so read-only search servers can reject stale source snapshots
+    /// before returning results. Stat-only drift with identical content does not
+    /// make the searchable index stale.
+    pub fn source_needs_update(
+        &self,
+        state: &IndexState,
+        languages: Option<&[Language]>,
+    ) -> Result<bool> {
+        let plan = self.compute_update_plan_impl(state, languages, true)?;
+        Ok(!plan.added.is_empty() || !plan.changed.is_empty() || !plan.deleted.is_empty())
+    }
+
     fn compute_update_plan(
         &self,
         state: &IndexState,
         languages: Option<&[Language]>,
     ) -> Result<UpdatePlan> {
-        let (current_files, _skipped) = self.scan_files(languages)?;
+        self.compute_update_plan_impl(state, languages, false)
+    }
+
+    fn compute_update_plan_impl(
+        &self,
+        state: &IndexState,
+        languages: Option<&[Language]>,
+        fail_on_read_error: bool,
+    ) -> Result<UpdatePlan> {
+        let (current_files, _skipped) = if fail_on_read_error {
+            self.scan_files_strict(languages)?
+        } else {
+            self.scan_files(languages)?
+        };
         let current_set: HashSet<_> = current_files.iter().cloned().collect();
 
         let mut plan = UpdatePlan::default();
 
         for path in &current_files {
-            // Skip files that previously failed to parse (e.g. invalid UTF-8)
+            let full_path = self.project_root.join(path);
+            // Previously unparseable files stay ignored while the failure
+            // persists, but become additions as soon as they are readable and
+            // hashable again. Otherwise an invalid-UTF-8 file that was later
+            // fixed would remain absent from the index forever.
             if state.ignored_files.contains(path) {
+                if std::fs::read_to_string(&full_path).is_ok()
+                    && hash_file(&full_path)
+                        .and_then(|hash| FileInfo::probe(&full_path, hash))
+                        .is_ok()
+                {
+                    plan.added.push(path.clone());
+                }
                 continue;
             }
-            let full_path = self.project_root.join(path);
 
             // Fast path: skip expensive content hashing only when BOTH the
             // nanosecond mtime and the size are unchanged. Without this gate
@@ -3324,6 +3385,14 @@ impl IndexBuilder {
 
             let hash = match hash_file(&full_path) {
                 Ok(h) => h,
+                Err(e) if fail_on_read_error => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to hash project file while checking freshness: {}",
+                            full_path.display()
+                        )
+                    });
+                }
                 Err(e) => {
                     eprintln!("⚠️  Skipping {} ({})", full_path.display(), e);
                     continue;
@@ -5274,6 +5343,68 @@ mod tests {
         assert_eq!(plan.touched[0].0, PathBuf::from("lib.py"));
         assert_eq!(plan.touched[0].1.mtime, real.mtime);
         assert_eq!(plan.touched[0].1.size, real.size);
+    }
+
+    #[test]
+    fn test_source_needs_update_detects_project_tree_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let tracked_path = temp.path().join("tracked.py");
+        std::fs::write(&tracked_path, "def tracked():\n    return 1\n").unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+        let mut state = IndexState::default();
+        state.files.insert(
+            PathBuf::from("tracked.py"),
+            FileInfo::probe(&tracked_path, hash_file(&tracked_path).unwrap()).unwrap(),
+        );
+
+        assert!(!builder.source_needs_update(&state, None).unwrap());
+
+        std::fs::write(&tracked_path, "def tracked():\n    return 200\n").unwrap();
+        assert!(builder.source_needs_update(&state, None).unwrap());
+
+        std::fs::write(&tracked_path, "def tracked():\n    return 1\n").unwrap();
+        state.files.insert(
+            PathBuf::from("tracked.py"),
+            FileInfo::probe(&tracked_path, hash_file(&tracked_path).unwrap()).unwrap(),
+        );
+        std::fs::write(temp.path().join("added.py"), "def added():\n    pass\n").unwrap();
+        assert!(builder.source_needs_update(&state, None).unwrap());
+
+        std::fs::remove_file(temp.path().join("added.py")).unwrap();
+        std::fs::remove_file(&tracked_path).unwrap();
+        assert!(builder.source_needs_update(&state, None).unwrap());
+    }
+
+    #[test]
+    fn test_source_needs_update_retries_fixed_ignored_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ignored_path = temp.path().join("ignored.py");
+        std::fs::write(&ignored_path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let builder = test_builder(temp.path(), &temp.path().join("index"));
+        let mut state = IndexState::default();
+        state.ignored_files.insert(PathBuf::from("ignored.py"));
+        assert!(!builder.source_needs_update(&state, None).unwrap());
+
+        std::fs::write(&ignored_path, "def recovered():\n    return True\n").unwrap();
+        assert!(builder.source_needs_update(&state, None).unwrap());
+        let plan = builder.compute_update_plan(&state, None).unwrap();
+        assert_eq!(plan.added, vec![PathBuf::from("ignored.py")]);
+    }
+
+    #[test]
+    fn test_source_needs_update_fails_closed_when_project_walk_fails() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_path_buf();
+        let index = tempfile::tempdir().unwrap();
+        let builder = test_builder(&project_path, index.path());
+        drop(project);
+
+        let error = builder
+            .source_needs_update(&IndexState::default(), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to walk project tree"));
     }
 
     /// Measures what the mtime fast path saves on the per-search update plan:

@@ -226,6 +226,7 @@ EXAMPLES:
 NOTES:
     • Loads one existing project/model index at startup
     • Never indexes or updates the project
+    • Rejects searches with stale_source when project files need re-indexing
     • Stdout contains protocol JSON only; diagnostics go to stderr";
 
 pub const CONFIG_HELP: &str = "\

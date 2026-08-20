@@ -100,6 +100,37 @@ fn prepared_index_loads_read_only_without_changing_files() {
 }
 
 #[test]
+fn missing_inverse_norm_sidecar_falls_back_without_writes() {
+    let dir = prepared_index();
+    fs::remove_file(dir.path().join("merged_inv_norms.npy")).unwrap();
+    fs::remove_file(dir.path().join("merged_inv_norms.manifest.json")).unwrap();
+    let before = snapshot_files(dir.path());
+
+    let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(index.num_documents(), 12);
+    drop(index);
+
+    assert_eq!(before, snapshot_files(dir.path()));
+}
+
+#[test]
+fn stale_inverse_norm_manifest_falls_back_without_writes() {
+    let dir = prepared_index();
+    let manifest_path = dir.path().join("merged_inv_norms.manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_reader(fs::File::open(&manifest_path).unwrap()).unwrap();
+    manifest["metadata_mtime"] = json!(0.0);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let before = snapshot_files(dir.path());
+
+    let index = MmapIndex::load_read_only(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(index.num_embeddings(), 36);
+    drop(index);
+
+    assert_eq!(before, snapshot_files(dir.path()));
+}
+
+#[test]
 fn compatibility_conversion_is_rejected_without_writes() {
     let dir = prepared_index();
     let metadata_path = dir.path().join("metadata.json");

@@ -288,13 +288,19 @@ EXAMPLES:
     # Clear all extra ignore patterns (revert to defaults only)
     colgrep settings --clear-ignore
 
-    # Force-include files/dirs that are normally ignored
+    # Force-include a directory the project's ignore rules exclude (e.g. a
+    # gitignored corpus); equivalent to running `colgrep init ./corpus`
+    colgrep settings --force-include ./corpus
+
+    # Force-include by pattern (global, applies to every project's walk;
+    # patterns cannot override .gitignore — use a directory path for that)
     colgrep settings --force-include .vscode --force-include vendor/internal
 
-    # Remove a force-include pattern
+    # Remove a force-include (directory registration or pattern)
+    colgrep settings --no-force-include ./corpus
     colgrep settings --no-force-include .vscode
 
-    # Clear all force-include patterns
+    # Clear all force-include patterns and directory registrations
     colgrep settings --clear-force-include
 
     # Show absolute paths in search output
@@ -341,7 +347,7 @@ pub struct Cli {
 
     // Default search arguments (when no subcommand is provided)
     /// Natural language query (runs search by default)
-    #[arg(value_name = "QUERY")]
+    #[arg(value_name = "QUERY", allow_hyphen_values = true)]
     pub query: Option<String>,
 
     /// Files or directories to search in (default: current directory)
@@ -524,6 +530,7 @@ pub enum Commands {
     #[command(after_help = SEARCH_HELP)]
     Search {
         /// Natural language query (optional if -e pattern is provided)
+        #[arg(value_name = "QUERY", allow_hyphen_values = true)]
         query: Option<String>,
 
         /// Files or directories to search in (default: current directory)
@@ -827,21 +834,26 @@ pub enum Commands {
         #[arg(long = "no-ignore", value_name = "PATTERN")]
         remove_ignore: Vec<String>,
 
-        /// Add patterns to force-include even if normally ignored
-        /// Can be repeated. Examples: --force-include .vscode --force-include vendor/internal
-        #[arg(long = "force-include", value_name = "PATTERN")]
+        /// Force-include something the ignore rules exclude. An existing directory
+        /// inside an indexed project is registered for that project and indexed on
+        /// its next update — the only form that overrides .gitignore (`colgrep init
+        /// <dir>` does the same). Anything else is a global pattern applied to every
+        /// project's walk. Can be repeated.
+        /// Examples: --force-include ./corpus --force-include "*.gen.go"
+        #[arg(long = "force-include", value_name = "PATTERN_OR_DIR")]
         add_force_include: Vec<String>,
 
-        /// Remove patterns from the force-include list
-        /// Can be repeated. Examples: --no-force-include .vscode
-        #[arg(long = "no-force-include", value_name = "PATTERN")]
+        /// Remove a force-include registration: a directory path unregisters that
+        /// project's directory (its files leave the index on the next update),
+        /// anything else is removed from the global pattern list. Can be repeated.
+        #[arg(long = "no-force-include", value_name = "PATTERN_OR_DIR")]
         remove_force_include: Vec<String>,
 
         /// Clear all custom ignore patterns (revert to defaults only)
         #[arg(long = "clear-ignore")]
         clear_ignore: bool,
 
-        /// Clear all force-include patterns
+        /// Clear all force-include patterns and directory registrations
         #[arg(long = "clear-force-include")]
         clear_force_include: bool,
     },
@@ -932,5 +944,56 @@ mod tests {
             .err()
             .expect("non-integer should be rejected");
         assert!(error.to_string().contains("positive integer"));
+    }
+
+    #[test]
+    fn a_query_starting_with_a_dash_parses_as_the_query() {
+        let cli = Cli::try_parse_from(["colgrep", "--glob flag option", "-k", "5"]).unwrap();
+        assert_eq!(cli.query.as_deref(), Some("--glob flag option"));
+        assert_eq!(cli.top_k, Some(5));
+    }
+
+    #[test]
+    fn a_dash_query_works_on_the_search_subcommand_too() {
+        let cli = Cli::try_parse_from(["colgrep", "search", "-k", "5", "--exclude flag"]).unwrap();
+        match cli.command {
+            Some(super::Commands::Search { query, top_k, .. }) => {
+                assert_eq!(query.as_deref(), Some("--exclude flag"));
+                assert_eq!(top_k, Some(5));
+            }
+            _ => panic!("expected the search subcommand"),
+        }
+    }
+
+    #[test]
+    fn known_flags_still_parse_as_flags() {
+        let cli = Cli::try_parse_from(["colgrep", "some query", "--json"]).unwrap();
+        assert_eq!(cli.query.as_deref(), Some("some query"));
+        assert!(cli.json);
+    }
+
+    #[test]
+    fn the_double_dash_separator_still_works() {
+        let cli = Cli::try_parse_from(["colgrep", "--", "-starts with dash"]).unwrap();
+        assert_eq!(cli.query.as_deref(), Some("-starts with dash"));
+    }
+
+    #[test]
+    fn query_with_e_pattern_and_flags_parses_each_into_its_slot() {
+        let cli = Cli::try_parse_from([
+            "colgrep",
+            "proxy auth on retries/redirects",
+            "-e",
+            "Client",
+            "-k",
+            "10",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.query.as_deref(),
+            Some("proxy auth on retries/redirects")
+        );
+        assert_eq!(cli.text_pattern.as_deref(), Some("Client"));
+        assert_eq!(cli.top_k, Some(10));
     }
 }

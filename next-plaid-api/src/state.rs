@@ -759,10 +759,21 @@ mod tests {
     use super::{ApiConfig, AppState, UPDATE_STATUS_RETENTION};
     use std::time::{Duration, SystemTime};
 
+    fn app_state(config: ApiConfig) -> AppState {
+        #[cfg(feature = "model")]
+        {
+            AppState::with_model_pool(config, None, None)
+        }
+        #[cfg(not(feature = "model"))]
+        {
+            AppState::new(config)
+        }
+    }
+
     #[test]
     fn update_health_status_tracks_active_and_completed_updates() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let state = AppState::new(ApiConfig {
+        let state = app_state(ApiConfig {
             index_dir: temp_dir.path().to_path_buf(),
             default_top_k: 10,
         });
@@ -801,7 +812,7 @@ mod tests {
     #[test]
     fn completed_update_elapsed_is_frozen_at_last_update() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let state = AppState::new(ApiConfig {
+        let state = app_state(ApiConfig {
             index_dir: temp_dir.path().to_path_buf(),
             default_top_k: 10,
         });

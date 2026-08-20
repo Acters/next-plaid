@@ -80,9 +80,15 @@ Supported models:
     )
 
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow loading HF models that ship custom modeling code (e.g. jinaai/jina-colbert-v2)",
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 1.6.5",
+        version="%(prog)s 1.7.0",
     )
 
     args = parser.parse_args()
@@ -99,6 +105,7 @@ Supported models:
             quantize=not args.no_quantize,
             verbose=not args.quiet,
             force=args.force,
+            trust_remote_code=args.trust_remote_code,
         )
 
         # Push to Hub if requested

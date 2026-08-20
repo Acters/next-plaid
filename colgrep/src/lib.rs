@@ -27,8 +27,8 @@ pub use index::paths::{
 pub use index::state::{IndexGeneration, IndexState, INDEX_FORMAT_VERSION};
 pub use index::{
     bre_to_ere, escape_literal_braces, index_exists, path_contains_ignored_dir,
-    prepare_glob_patterns, IndexBuilder, SearchResult, Searcher, UpdatePlan, UpdateStats,
-    CONFIRMATION_THRESHOLD, MAX_GLOB_EXPANSIONS, MAX_GLOB_PATTERNS,
+    prepare_glob_patterns, scan_reaches_subdir, IndexBuilder, SearchResult, Searcher, UpdatePlan,
+    UpdateStats, CONFIRMATION_THRESHOLD, MAX_GLOB_EXPANSIONS, MAX_GLOB_PATTERNS,
 };
 pub use model::{ensure_model, resolve_quantized, DEFAULT_MODEL};
 pub use onnx_runtime::{ensure_onnx_runtime, is_cudnn_available};
